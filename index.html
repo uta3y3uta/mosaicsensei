@@ -91,6 +91,20 @@
         </select>
       </label>
     </div>
+    <div class="row auto-sub" id="textSub">
+      <label class="mini check">
+        <input type="checkbox" id="chkText" checked>
+        名前・文字もかくす
+      </label>
+      <label class="mini">
+        文字の探し方
+        <select id="selTextLevel">
+          <option value="low">ひかえめ</option>
+          <option value="mid" selected>ふつう</option>
+          <option value="high">とことん探す</option>
+        </select>
+      </label>
+    </div>
 
     <!-- 道具 -->
     <div class="row tools" role="tablist">
@@ -109,6 +123,21 @@
       <button class="tool" data-tool="crop" title="トリミング">
         <svg viewBox="0 0 24 24"><path d="M6 2v16h16"/><path d="M2 6h16v16"/></svg><span>切り抜き</span>
       </button>
+    </div>
+
+    <!-- 選んだ範囲の個別設定 -->
+    <div class="row sel-row" id="selRow" hidden>
+      <div class="sel-head">
+        <span class="sec-title">選んだ範囲</span>
+        <div class="sel-btns">
+          <button id="btnSelDelete" class="ghost-btn danger slim">削除</button>
+          <button id="btnSelDone" class="ghost-btn slim">選択をやめる</button>
+        </div>
+      </div>
+      <label class="mini wide" id="sizeRow">大きさ <output id="outSize">100</output>
+        <input type="range" id="rngSize" min="30" max="260" value="100">
+      </label>
+      <p class="sel-note">下の「かくし方」と「こさ」は，この範囲だけに反映されます。</p>
     </div>
 
     <div class="row brush-row" id="brushRow" hidden>
@@ -189,6 +218,7 @@
 <script src="vendor/utif.js"></script>
 <script src="vendor/heic2any.min.js"></script>
 <script src="js/effects.js"></script>
+<script src="js/textdetect.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

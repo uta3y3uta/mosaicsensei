@@ -12,9 +12,12 @@
     dropzone: $('dropzone'), file: $('fileInput'),
     panel: $('panel'), chkAuto: $('chkAuto'), autoSub: $('autoSub'),
     selSens: $('selSensitivity'), selPad: $('selPadding'), btnRedetect: $('btnRedetect'),
+    textSub: $('textSub'), chkText: $('chkText'), selTextLevel: $('selTextLevel'),
     catTabs: $('catTabs'), fxStrip: $('effectStrip'),
     rngStrength: $('rngStrength'), outStrength: $('outStrength'),
     rngBrush: $('rngBrush'), outBrush: $('outBrush'), brushRow: $('brushRow'),
+    selRow: $('selRow'), rngSize: $('rngSize'), outSize: $('outSize'),
+    btnSelDelete: $('btnSelDelete'), btnSelDone: $('btnSelDone'),
     cropBar: $('cropBar'), btnCropApply: $('btnCropApply'), btnCropReset: $('btnCropReset'),
     btnUndo: $('btnUndo'), btnRedo: $('btnRedo'), btnSave: $('btnSave'), btnNew: $('btnNew'),
     btnClear: $('btnClear'), countLabel: $('countLabel'), targetHint: $('targetHint'),
@@ -181,7 +184,7 @@
     for (const b of boxes) {
       const px = b.w * pad, py = b.h * pad;
       const r = {
-        id: S.nextId++, shape: 'ellipse', auto: true,
+        id: S.nextId++, shape: 'ellipse', auto: true, kind: 'face',
         x: clamp(b.x - px, 0, S.img.width),
         y: clamp(b.y - py * 1.25, 0, S.img.height),
         w: b.w + px * 2, h: b.h + py * 2.2,
@@ -192,10 +195,45 @@
       if (S.regions.some(o => iou(bbox(o), r) > 0.4)) continue;
       S.regions.push(r); added++;
     }
+    const texts = await detectText();
+
     render(); pushHistory(); buildThumbs(); unbusy();
-    if (added) toast(added + '人の顔をぼかしました');
+    if (added && texts) toast(added + '人の顔と，文字' + texts + 'か所をぼかしました');
+    else if (added) toast(added + '人の顔をぼかしました');
+    else if (texts) toast('文字' + texts + 'か所をぼかしました');
     else if (!silent) toast('顔が見つかりませんでした。手動で囲んでください');
     else toast('顔が見つかりません。手動で囲んでください');
+  }
+
+  /* 名札・ネームカード・掲示物など，文字が書かれた場所をさがす */
+  async function detectText() {
+    if (!S.img || !el.chkText.checked || !window.TextDetect) return 0;
+    busy('名前や文字をさがしています…');
+    await nextFrame();
+    S.regions = S.regions.filter(r => r.kind !== 'text');
+    if (S.selected && !getRegion(S.selected)) S.selected = null;
+    let boxes;
+    try {
+      boxes = TextDetect.find(S.img, el.selTextLevel.value);
+    } catch (e) {
+      return 0;
+    }
+    let added = 0;
+    for (const b of boxes) {
+      const px = Math.max(3, b.w * 0.08), py = Math.max(3, b.h * 0.18);
+      const r = {
+        id: S.nextId++, shape: 'rect', auto: true, kind: 'text',
+        x: clamp(b.x - px, 0, S.img.width),
+        y: clamp(b.y - py, 0, S.img.height),
+        w: b.w + px * 2, h: b.h + py * 2,
+        effect: S.effect, strength: S.strength
+      };
+      r.w = Math.min(r.w, S.img.width - r.x);
+      r.h = Math.min(r.h, S.img.height - r.y);
+      if (S.regions.some(o => iou(bbox(o), r) > 0.35)) continue;
+      S.regions.push(r); added++;
+    }
+    return added;
   }
 
   /* ================= 範囲 ================= */
@@ -315,8 +353,52 @@
     renderTo(vctx, cr);
     drawOverlay(cr);
     el.countLabel.textContent = 'かくし範囲：' + S.regions.length;
-    el.targetHint.textContent = S.selected ? '選んだ範囲に適用' : '全体に適用';
+    el.targetHint.textContent = S.selected ? '選んだ範囲だけに適用' : '全体に適用';
+    syncSelRow();
   }
+
+  /* ---- 選んだ範囲の個別設定 ---- */
+  let sizeBaseId = null, sizeBase = null;
+
+  function captureSizeBase(r) {
+    sizeBase = r.shape === 'brush'
+      ? { r: r.r }
+      : { w: Math.abs(r.w), h: Math.abs(r.h), cx: r.x + r.w / 2, cy: r.y + r.h / 2 };
+    sizeBaseId = r.id;
+    el.rngSize.value = 100; el.outSize.value = 100;
+  }
+
+  function syncSelRow() {
+    const r = S.selected ? getRegion(S.selected) : null;
+    el.selRow.hidden = !r || S.tool === 'crop';
+    if (!r) { sizeBaseId = null; sizeBase = null; return; }
+    if (sizeBaseId !== r.id) captureSizeBase(r);
+  }
+
+  el.rngSize.addEventListener('input', () => {
+    const r = S.selected ? getRegion(S.selected) : null;
+    if (!r || !sizeBase) return;
+    const k = +el.rngSize.value / 100;
+    el.outSize.value = el.rngSize.value;
+    if (r.shape === 'brush') {
+      r.r = Math.max(2, sizeBase.r * k);
+    } else {
+      r.w = Math.max(8, sizeBase.w * k);
+      r.h = Math.max(8, sizeBase.h * k);
+      r.x = sizeBase.cx - r.w / 2;
+      r.y = sizeBase.cy - r.h / 2;
+    }
+    scheduleRender();
+  });
+  el.rngSize.addEventListener('change', () => { pushHistory(); buildThumbs(); });
+
+  el.btnSelDelete.addEventListener('click', () => {
+    if (!S.selected) return;
+    S.regions = S.regions.filter(r => r.id !== S.selected);
+    S.selected = null;
+    render(); pushHistory(); buildThumbs();
+  });
+  el.btnSelDone.addEventListener('click', () => { S.selected = null; render(); buildThumbs(); });
 
   function drawOverlay(cr) {
     const k = el.overlay.width / cr.w;
@@ -574,6 +656,7 @@
     }
     if (['brush', 'move', 'moveBrush', 'resize'].indexOf(d.mode) >= 0) {
       if (d.region && d.region.shape !== 'brush') normalize(d.region);
+      if (d.region && d.region.id === S.selected) captureSizeBase(d.region);
       render(); pushHistory(); return;
     }
     if (d.mode.indexOf('crop') === 0) { render(); return; }
@@ -817,11 +900,33 @@
   el.chkAuto.addEventListener('change', async () => {
     S.autoMode = el.chkAuto.checked;
     el.autoSub.classList.toggle('off', !S.autoMode);
+    el.textSub.classList.toggle('off', !S.autoMode);
     el.btnRedetect.disabled = !S.autoMode;
     if (S.autoMode && S.img) await detectFaces(false);
     else if (!S.autoMode) toast('手動モード：これまでの加工はそのまま編集できます');
   });
   el.btnRedetect.addEventListener('click', () => detectFaces(false));
+
+  el.chkText.addEventListener('change', async () => {
+    if (!S.img) return;
+    if (el.chkText.checked) {
+      const n = await detectText();
+      render(); pushHistory(); buildThumbs(); unbusy();
+      toast(n ? '文字' + n + 'か所をぼかしました' : '文字らしい場所は見つかりませんでした');
+    } else {
+      const before = S.regions.length;
+      S.regions = S.regions.filter(r => r.kind !== 'text');
+      if (S.selected && !getRegion(S.selected)) S.selected = null;
+      render(); pushHistory(); buildThumbs();
+      if (before !== S.regions.length) toast('文字のぼかしを外しました');
+    }
+  });
+  el.selTextLevel.addEventListener('change', async () => {
+    if (!S.img || !el.chkText.checked) return;
+    const n = await detectText();
+    render(); pushHistory(); buildThumbs(); unbusy();
+    toast(n ? '文字' + n + 'か所をぼかしました' : '文字らしい場所は見つかりませんでした');
+  });
 
   el.btnClear.addEventListener('click', () => {
     if (!S.regions.length) return;
