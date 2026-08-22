@@ -1,4 +1,4 @@
-/* 顔かくし — すべての処理は端末内で完結します */
+/* スクールプライバシー — すべての処理は端末内で完結します */
 (function () {
   'use strict';
 
@@ -10,30 +10,41 @@
     stage: $('stage'), welcome: $('welcome'), editor: $('editor'),
     wrap: $('canvasWrap'), view: $('view'), overlay: $('overlay'),
     dropzone: $('dropzone'), file: $('fileInput'),
-    panel: $('panel'), chkAuto: $('chkAuto'), autoSub: $('autoSub'),
-    selSens: $('selSensitivity'), selPad: $('selPadding'), btnRedetect: $('btnRedetect'),
-    textSub: $('textSub'), chkText: $('chkText'), selTextLevel: $('selTextLevel'),
+    panel: $('panel'),
+    btnAuto: $('btnAuto'), btnText: $('btnText'), lvlSeg: $('lvlSeg'), btnRedetect: $('btnRedetect'),
     catTabs: $('catTabs'), fxStrip: $('effectStrip'),
-    rngStrength: $('rngStrength'), outStrength: $('outStrength'),
-    rngBrush: $('rngBrush'), outBrush: $('outBrush'), brushRow: $('brushRow'),
-    selRow: $('selRow'), rngSize: $('rngSize'), outSize: $('outSize'),
-    btnSelDelete: $('btnSelDelete'), btnSelDone: $('btnSelDone'),
+    rngStrength: $('rngStrength'), rngBrush: $('rngBrush'), brushRow: $('brushRow'),
+    selRow: $('selRow'), rngSize: $('rngSize'),
+    btnSelDel: $('btnSelDel'), btnSelClose: $('btnSelClose'),
     cropBar: $('cropBar'), btnCropApply: $('btnCropApply'), btnCropReset: $('btnCropReset'),
     btnUndo: $('btnUndo'), btnRedo: $('btnRedo'), btnSave: $('btnSave'), btnNew: $('btnNew'),
-    btnClear: $('btnClear'), countLabel: $('countLabel'), targetHint: $('targetHint'),
+    btnClear: $('btnClear'), countLabel: $('countLabel'), ctxMenu: $('ctxMenu'),
     busy: $('busy'), busyText: $('busyText'), toast: $('toast'),
-    modal: $('saveModal'), fmtSeg: $('fmtSeg'), fmtNote: $('fmtNote'),
-    qualityRow: $('qualityRow'), rngQuality: $('rngQuality'), outQuality: $('outQuality'),
+    modal: $('saveModal'), fmtSeg: $('fmtSeg'),
+    qualityRow: $('qualityRow'), rngQuality: $('rngQuality'),
     saveInfo: $('saveInfo'), btnSaveDo: $('btnSaveDo'), btnSaveCancel: $('btnSaveCancel'),
     btnShare: $('btnShare'), zoomHint: $('zoomHint')
   };
 
   const vctx = el.view.getContext('2d', { willReadFrequently: true });
   const octx = el.overlay.getContext('2d');
+  const countOut = el.countLabel.querySelector('b');
+
+  /* 弱・中・強のひとつのつまみで，顔と文字のさがし方をまとめて決める。
+     conf: 顔と判定する自信のしきい値（低いほど拾う）
+     pad: 顔のまわりをどれだけ広くかくすか
+     passes: 顔さがしの手数（2で左右反転，3でタイル分割まで）
+     text: 文字さがしの強さ */
+  const LV = {
+    1: { conf: 0.45, pad: 0.18, passes: 1, text: 'low' },
+    2: { conf: 0.20, pad: 0.28, passes: 2, text: 'mid' },
+    3: { conf: 0.05, pad: 0.42, passes: 3, text: 'high' }
+  };
 
   const S = {
     img: null, crop: null, regions: [], nextId: 1,
-    autoMode: true, tool: 'rect', effect: 'square', strength: 45, brush: 40,
+    autoFace: true, autoText: true, level: 2,
+    tool: 'rect', effect: 'square', strength: 45, brush: 40,
     selected: null, cat: 'モザイク',
     cropDraft: null, ratio: 'free',
     history: [], hi: -1,
@@ -133,14 +144,24 @@
     pushHistory();
     unbusy();
 
-    if (S.autoMode) await detectFaces(true);
+    if (S.autoFace || S.autoText) await runDetect(true);
   }
 
-  /* ================= 顔検出 ================= */
+  /* ================= 顔さがし ================= */
   let modelsReady = false;
   async function ensureModels() {
     if (modelsReady) return;
     busy('顔認識の準備をしています…（初回のみ）');
+    /* 使う計算方法を先に決めておく。決めておかないと，同こんしていない
+       wasm のファイルを取りにいこうとして，読みこみに失敗した記録が残る。 */
+    try {
+      const tf = faceapi.tf;
+      if (tf && tf.setBackend) {
+        const ok = await tf.setBackend('webgl').catch(() => false);
+        if (!ok) await tf.setBackend('cpu').catch(() => {});
+        await tf.ready();
+      }
+    } catch (e) { /* 決められなくても，そのまま進めてよい */ }
     await faceapi.nets.ssdMobilenetv1.loadFromUri('models');
     await faceapi.nets.tinyFaceDetector.loadFromUri('models');
     modelsReady = true;
@@ -153,36 +174,103 @@
     return i / (a.w * a.h + b.w * b.h - i || 1);
   }
 
-  async function detectFaces(silent) {
-    if (!S.img) return;
+  function mirrorOf(img) {
+    const c = mk(img.width, img.height);
+    const x = c.getContext('2d');
+    x.translate(img.width, 0); x.scale(-1, 1);
+    x.drawImage(img, 0, 0);
+    return c;
+  }
+
+  /* 画像を重なりつきのタイルに割る。1枚ずつ見れば，遠くの小さな顔も
+     モデルの入力サイズに対して十分な大きさになる。 */
+  function tilesOf(img, cols, rows, ov) {
+    const out = [];
+    const tw = img.width / cols, th = img.height / rows;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = Math.max(0, Math.round(c * tw - tw * ov));
+        const y = Math.max(0, Math.round(r * th - th * ov));
+        const w = Math.min(img.width - x, Math.round(tw * (1 + ov * 2)));
+        const h = Math.min(img.height - y, Math.round(th * (1 + ov * 2)));
+        if (w < 40 || h < 40) continue;
+        const cv = mk(w, h);
+        cv.getContext('2d').drawImage(img, x, y, w, h, 0, 0, w, h);
+        out.push({ canvas: cv, x: x, y: y });
+      }
+    }
+    return out;
+  }
+
+  /* 正面顔だけでなく横顔も拾えるよう，何通りかの見方を重ねる。
+     ・SSD と Tiny の2つのモデル
+     ・左右反転した画像（横顔は向きによって見つかりやすさが変わる）
+     ・タイル分割（遠くの小さな顔） */
+  async function findFaces(lv) {
+    const out = [];
+    const add = (dets, back) => {
+      for (const d of dets) {
+        const b = back({ x: d.box.x, y: d.box.y, w: d.box.width, h: d.box.height });
+        if (b.w < 8 || b.h < 8) continue;
+        if (!out.some(o => iou(o, b) > 0.32)) out.push(b);
+      }
+    };
+    const same = b => b;
+    const ssd = c => faceapi.detectAllFaces(c,
+      new faceapi.SsdMobilenetv1Options({ minConfidence: lv.conf, maxResults: 400 }));
+    const tinyScore = Math.max(0.15, Math.min(0.5, lv.conf * 1.6));
+    const tiny = (c, size) => faceapi.detectAllFaces(c,
+      new faceapi.TinyFaceDetectorOptions({ inputSize: size, scoreThreshold: tinyScore }));
+
+    add(await ssd(S.img), same);
+    add(await tiny(S.img, 608), same);
+
+    if (lv.passes >= 2) {
+      busy('横顔もさがしています…');
+      await nextFrame();
+      const m = mirrorOf(S.img);
+      const flip = b => ({ x: S.img.width - b.x - b.w, y: b.y, w: b.w, h: b.h });
+      add(await ssd(m), flip);
+      add(await tiny(m, 608), flip);
+    }
+
+    if (lv.passes >= 3) {
+      busy('小さな顔もさがしています…');
+      await nextFrame();
+      add(await tiny(S.img, 800), same);
+      for (const t of tilesOf(S.img, 2, 2, 0.18)) {
+        const back = b => ({ x: b.x + t.x, y: b.y + t.y, w: b.w, h: b.h });
+        add(await ssd(t.canvas), back);
+        add(await tiny(t.canvas, 512), back);
+      }
+    }
+    return out;
+  }
+
+  function dropKind(kind) {
+    const before = S.regions.length;
+    S.regions = S.regions.filter(r => r.kind !== kind);
+    if (S.selected && !getRegion(S.selected)) S.selected = null;
+    return before - S.regions.length;
+  }
+
+  async function detectFaces(lv) {
     busy('顔をさがしています…');
     await nextFrame();
-    let boxes = [];
+    let boxes;
     try {
       await ensureModels();
       busy('顔をさがしています…');
       await nextFrame();
-      const conf = parseFloat(el.selSens.value);
-      const collect = dets => {
-        for (const d of dets) {
-          const b = { x: d.box.x, y: d.box.y, w: d.box.width, h: d.box.height };
-          if (!boxes.some(o => iou(o, b) > 0.3)) boxes.push(b);
-        }
-      };
-      collect(await faceapi.detectAllFaces(S.img,
-        new faceapi.SsdMobilenetv1Options({ minConfidence: conf, maxResults: 300 })));
-      collect(await faceapi.detectAllFaces(S.img,
-        new faceapi.TinyFaceDetectorOptions({ inputSize: 608, scoreThreshold: 0.5 })));
+      boxes = await findFaces(lv);
     } catch (e) {
-      unbusy();
-      toast('顔検出を読み込めませんでした。手動モードでお使いください');
-      return;
+      toast('顔検出を読み込めませんでした。手で囲んでお使いください');
+      return 0;
     }
-
-    const pad = parseFloat(el.selPad.value);
+    dropKind('face');
     let added = 0;
     for (const b of boxes) {
-      const px = b.w * pad, py = b.h * pad;
+      const px = b.w * lv.pad, py = b.h * lv.pad;
       const r = {
         id: S.nextId++, shape: 'ellipse', auto: true, kind: 'face',
         x: clamp(b.x - px, 0, S.img.width),
@@ -192,35 +280,24 @@
       };
       r.w = Math.min(r.w, S.img.width - r.x);
       r.h = Math.min(r.h, S.img.height - r.y);
-      if (S.regions.some(o => iou(bbox(o), r) > 0.4)) continue;
+      if (S.regions.some(o => iou(bbox(o), r) > 0.42)) continue;
       S.regions.push(r); added++;
     }
-    const texts = await detectText();
-
-    render(); pushHistory(); buildThumbs(); unbusy();
-    if (added && texts) toast(added + '人の顔と，文字' + texts + 'か所をぼかしました');
-    else if (added) toast(added + '人の顔をぼかしました');
-    else if (texts) toast('文字' + texts + 'か所をぼかしました');
-    else if (!silent) toast('顔が見つかりませんでした。手動で囲んでください');
-    else toast('顔が見つかりません。手動で囲んでください');
+    return added;
   }
 
   /* 名札・ネームカード・掲示物など，文字が書かれた場所をさがす */
-  async function detectText() {
-    if (!S.img || !el.chkText.checked || !window.TextDetect) return 0;
+  async function detectText(lv) {
+    if (!window.TextDetect) return 0;
     busy('名前や文字をさがしています…');
     await nextFrame();
-    S.regions = S.regions.filter(r => r.kind !== 'text');
-    if (S.selected && !getRegion(S.selected)) S.selected = null;
+    dropKind('text');
     let boxes;
-    try {
-      boxes = TextDetect.find(S.img, el.selTextLevel.value);
-    } catch (e) {
-      return 0;
-    }
+    try { boxes = TextDetect.find(S.img, lv.text); }
+    catch (e) { return 0; }
     let added = 0;
     for (const b of boxes) {
-      const px = Math.max(3, b.w * 0.08), py = Math.max(3, b.h * 0.18);
+      const px = Math.max(2, b.w * 0.04), py = Math.max(2, b.h * 0.08);
       const r = {
         id: S.nextId++, shape: 'rect', auto: true, kind: 'text',
         x: clamp(b.x - px, 0, S.img.width),
@@ -234,6 +311,19 @@
       S.regions.push(r); added++;
     }
     return added;
+  }
+
+  async function runDetect(silent) {
+    if (!S.img) return;
+    const lv = LV[S.level];
+    let faces = 0, texts = 0;
+    if (S.autoFace) faces = await detectFaces(lv);
+    if (S.autoText) texts = await detectText(lv);
+    render(); pushHistory(); buildThumbs(); unbusy();
+    if (faces && texts) toast('顔' + faces + '・文字' + texts + 'をかくしました');
+    else if (faces) toast('顔' + faces + 'をかくしました');
+    else if (texts) toast('文字' + texts + 'か所をかくしました');
+    else toast('見つかりませんでした。手で囲んでください');
   }
 
   /* ================= 範囲 ================= */
@@ -250,6 +340,46 @@
     const b = bbox(r); r.x = b.x; r.y = b.y; r.w = b.w; r.h = b.h; return r;
   }
   const getRegion = id => S.regions.find(r => r.id === id);
+
+  /* ---- 回転 ----
+     四角と丸は r.rot（ラジアン）を持つ。bbox() は回した前の四角なので，
+     実際に画面のどこを占めるかは outerBox() で求める。
+     ブラシは点そのものを回すので rot を持たない。 */
+  const rotOf = r => (r.shape === 'brush' ? 0 : (r.rot || 0));
+
+  function centerOf(r) {
+    const b = bbox(r);
+    return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+  }
+
+  /* 回した図形を包む，軸に沿った四角 */
+  function outerBox(r) {
+    const b = bbox(r), a = rotOf(r);
+    if (!a) return b;
+    const c = Math.abs(Math.cos(a)), s = Math.abs(Math.sin(a));
+    const w = b.w * c + b.h * s, h = b.w * s + b.h * c;
+    return { x: b.x + b.w / 2 - w / 2, y: b.y + b.h / 2 - h / 2, w: w, h: h };
+  }
+
+  /* 画面の点を，その範囲から見た「回す前」の位置に直す */
+  function toLocal(r, p) {
+    const a = rotOf(r);
+    if (!a) return p;
+    const c = centerOf(r);
+    const cs = Math.cos(-a), sn = Math.sin(-a);
+    const dx = p.x - c.x, dy = p.y - c.y;
+    return { x: c.x + dx * cs - dy * sn, y: c.y + dx * sn + dy * cs };
+  }
+
+  /* 回す前の位置を，画面の点に直す */
+  function toWorld(r, p) {
+    const a = rotOf(r);
+    if (!a) return p;
+    const c = centerOf(r);
+    const cs = Math.cos(a), sn = Math.sin(a);
+    const dx = p.x - c.x, dy = p.y - c.y;
+    return { x: c.x + dx * cs - dy * sn, y: c.y + dx * sn + dy * cs };
+  }
 
   function cropRect() {
     if (!S.img) return { x: 0, y: 0, w: 1, h: 1 };
@@ -279,38 +409,48 @@
   function applyTransform() {
     el.wrap.style.transform = 'translate(' + V.tx + 'px,' + V.ty + 'px) scale(' + V.z + ')';
     el.zoomHint.hidden = V.z <= 1.01;
-    if (!el.zoomHint.hidden) el.zoomHint.textContent = Math.round(V.z * 100) + '%（ダブルタップで戻る）';
+    if (!el.zoomHint.hidden) el.zoomHint.textContent = Math.round(V.z * 100) + '%';
   }
 
   const supportsFilter = typeof vctx.filter === 'string';
 
+  /* ブラシは「なぞったところ」そのものが範囲。四角や丸に置きかえない。 */
+  function strokePath(ctx, r, X, Y) {
+    ctx.beginPath();
+    r.pts.forEach((p, i) => i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)));
+    if (r.pts.length === 1) ctx.lineTo(X(r.pts[0].x) + 0.01, Y(r.pts[0].y));
+  }
+
   function maskPath(ctx, r, k, cr, ox, oy) {
     ctx.fillStyle = '#fff'; ctx.strokeStyle = '#fff';
     const X = v => (v - cr.x) * k + ox, Y = v => (v - cr.y) * k + oy;
-    if (r.shape === 'rect') {
-      const b = bbox(r);
-      ctx.fillRect(X(b.x), Y(b.y), b.w * k, b.h * k);
-    } else if (r.shape === 'ellipse') {
-      const b = bbox(r);
-      ctx.beginPath();
-      ctx.ellipse(X(b.x + b.w / 2), Y(b.y + b.h / 2), b.w * k / 2, b.h * k / 2, 0, 0, 6.2832);
-      ctx.fill();
+    if (r.shape === 'rect' || r.shape === 'ellipse') {
+      const b = bbox(r), a = rotOf(r);
+      const cx = X(b.x + b.w / 2), cy = Y(b.y + b.h / 2);
+      ctx.save();
+      ctx.translate(cx, cy);
+      if (a) ctx.rotate(a);
+      if (r.shape === 'ellipse') {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, b.w * k / 2, b.h * k / 2, 0, 0, 6.2832);
+        ctx.fill();
+      } else {
+        ctx.fillRect(-b.w * k / 2, -b.h * k / 2, b.w * k, b.h * k);
+      }
+      ctx.restore();
     } else {
       ctx.lineWidth = r.r * 2 * k; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      ctx.beginPath();
-      r.pts.forEach((p, i) => i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)));
-      if (r.pts.length === 1) { ctx.lineTo(X(r.pts[0].x) + 0.01, Y(r.pts[0].y)); }
+      strokePath(ctx, r, X, Y);
       ctx.stroke();
     }
   }
 
   function paintRegion(ctx, r, k, cr) {
-    const b = bbox(r);
-    const pad = r.shape === 'brush' ? r.r : 0;
-    const x0 = Math.floor((b.x - pad - cr.x) * k), y0 = Math.floor((b.y - pad - cr.y) * k);
-    const x1 = Math.ceil((b.x + b.w + pad - cr.x) * k), y1 = Math.ceil((b.y + b.h + pad - cr.y) * k);
-    const cx0 = clamp(x0, 0, ctx.canvas.width), cy0 = clamp(y0, 0, ctx.canvas.height);
-    const cx1 = clamp(x1, 0, ctx.canvas.width), cy1 = clamp(y1, 0, ctx.canvas.height);
+    const b = outerBox(r);
+    const x0 = Math.floor((b.x - cr.x) * k), y0 = Math.floor((b.y - cr.y) * k);
+    const x1 = Math.ceil((b.x + b.w - cr.x) * k), y1 = Math.ceil((b.y + b.h - cr.y) * k);
+    const cx0 = clamp(x0 - 2, 0, ctx.canvas.width), cy0 = clamp(y0 - 2, 0, ctx.canvas.height);
+    const cx1 = clamp(x1 + 2, 0, ctx.canvas.width), cy1 = clamp(y1 + 2, 0, ctx.canvas.height);
     const w = cx1 - cx0, h = cy1 - cy0;
     if (w < 2 || h < 2) return;
 
@@ -322,7 +462,11 @@
     tc.save();
     tc.globalCompositeOperation = 'destination-in';
     if (supportsFilter && r.shape !== 'rect') {
-      tc.filter = 'blur(' + Math.max(1, Math.min(w, h) * 0.035).toFixed(1) + 'px)';
+      // ブラシはなぞった太さに応じたぼかしにする（線が太らないように）
+      const f = r.shape === 'brush'
+        ? Math.max(0.5, r.r * k * 0.18)
+        : Math.max(1, Math.min(w, h) * 0.035);
+      tc.filter = 'blur(' + f.toFixed(1) + 'px)';
     }
     maskPath(tc, r, k, cr, -cx0, -cy0);
     tc.restore();
@@ -352,8 +496,7 @@
     const cr = cropRect();
     renderTo(vctx, cr);
     drawOverlay(cr);
-    el.countLabel.textContent = 'かくし範囲：' + S.regions.length;
-    el.targetHint.textContent = S.selected ? '選んだ範囲だけに適用' : '全体に適用';
+    countOut.textContent = S.regions.length;
     syncSelRow();
   }
 
@@ -365,7 +508,7 @@
       ? { r: r.r }
       : { w: Math.abs(r.w), h: Math.abs(r.h), cx: r.x + r.w / 2, cy: r.y + r.h / 2 };
     sizeBaseId = r.id;
-    el.rngSize.value = 100; el.outSize.value = 100;
+    el.rngSize.value = 100;
   }
 
   function syncSelRow() {
@@ -379,7 +522,6 @@
     const r = S.selected ? getRegion(S.selected) : null;
     if (!r || !sizeBase) return;
     const k = +el.rngSize.value / 100;
-    el.outSize.value = el.rngSize.value;
     if (r.shape === 'brush') {
       r.r = Math.max(2, sizeBase.r * k);
     } else {
@@ -392,13 +534,13 @@
   });
   el.rngSize.addEventListener('change', () => { pushHistory(); buildThumbs(); });
 
-  el.btnSelDelete.addEventListener('click', () => {
+  el.btnSelDel.addEventListener('click', () => {
     if (!S.selected) return;
     S.regions = S.regions.filter(r => r.id !== S.selected);
     S.selected = null;
     render(); pushHistory(); buildThumbs();
   });
-  el.btnSelDone.addEventListener('click', () => { S.selected = null; render(); buildThumbs(); });
+  el.btnSelClose.addEventListener('click', () => { S.selected = null; render(); buildThumbs(); });
 
   function drawOverlay(cr) {
     const k = el.overlay.width / cr.w;
@@ -434,28 +576,47 @@
 
     // 各範囲の枠
     for (const r of S.regions) {
-      const b = bbox(r);
       const sel = r.id === S.selected;
       octx.save();
-      octx.setLineDash(sel ? [] : [5 * px, 4 * px]);
-      octx.lineWidth = (sel ? 2.2 : 1.3) * px;
-      octx.strokeStyle = sel ? '#0095f6' : 'rgba(255,255,255,.55)';
-      if (r.shape === 'ellipse') {
-        octx.beginPath();
-        octx.ellipse(X(b.x + b.w / 2), Y(b.y + b.h / 2), b.w * k / 2, b.h * k / 2, 0, 0, 6.2832);
+      if (r.shape === 'brush') {
+        // なぞった形そのものを薄く見せる（四角い枠は出さない）
+        octx.lineCap = 'round'; octx.lineJoin = 'round';
+        octx.lineWidth = Math.max(1, r.r * 2 * k);
+        octx.strokeStyle = sel ? '#0095f6' : '#ffffff';
+        octx.globalAlpha = sel ? .34 : .16;
+        strokePath(octx, r, X, Y);
         octx.stroke();
-      } else if (r.shape === 'brush') {
-        octx.strokeRect(X(b.x), Y(b.y), b.w * k, b.h * k);
       } else {
-        octx.strokeRect(X(b.x), Y(b.y), b.w * k, b.h * k);
+        const b = bbox(r);
+        octx.translate(X(b.x + b.w / 2), Y(b.y + b.h / 2));
+        octx.rotate(rotOf(r));
+        octx.setLineDash(sel ? [] : [5 * px, 4 * px]);
+        octx.lineWidth = (sel ? 2.2 : 1.3) * px;
+        octx.strokeStyle = sel ? '#0095f6' : 'rgba(255,255,255,.55)';
+        if (r.shape === 'ellipse') {
+          octx.beginPath();
+          octx.ellipse(0, 0, b.w * k / 2, b.h * k / 2, 0, 0, 6.2832);
+          octx.stroke();
+        } else {
+          octx.strokeRect(-b.w * k / 2, -b.h * k / 2, b.w * k, b.h * k);
+        }
       }
       octx.restore();
+
       if (sel && r.shape !== 'brush') {
         const hs = 10 * px;
         octx.fillStyle = '#fff'; octx.strokeStyle = '#0095f6'; octx.lineWidth = 1.6 * px;
-        for (const c of corners({ x: X(b.x), y: Y(b.y), w: b.w * k, h: b.h * k })) {
-          octx.beginPath(); octx.arc(c.x, c.y, hs / 2, 0, 6.2832); octx.fill(); octx.stroke();
+        for (const c of handlePoints(r)) {
+          octx.beginPath(); octx.arc(X(c.x), Y(c.y), hs / 2, 0, 6.2832); octx.fill(); octx.stroke();
         }
+        // 回すためのつまみ。図形の上に棒でつないで出す
+        const rp = rotHandlePoint(r), tp = rotHandleAnchor(r);
+        octx.save();
+        octx.strokeStyle = '#0095f6'; octx.lineWidth = 1.6 * px;
+        octx.beginPath(); octx.moveTo(X(tp.x), Y(tp.y)); octx.lineTo(X(rp.x), Y(rp.y)); octx.stroke();
+        octx.fillStyle = '#0095f6'; octx.strokeStyle = '#fff';
+        octx.beginPath(); octx.arc(X(rp.x), Y(rp.y), hs * 0.62, 0, 6.2832); octx.fill(); octx.stroke();
+        octx.restore();
       }
     }
 
@@ -481,6 +642,22 @@
       { x: b.x, y: b.y + b.h / 2, id: 'w' }
     ];
   }
+  /* つまみの位置は，回したあとの画面上の座標で返す */
+  function handlePoints(r) {
+    return corners(bbox(r)).map(c => {
+      const w = toWorld(r, c);
+      return { x: w.x, y: w.y, id: c.id };
+    });
+  }
+  const rotArm = r => Math.max(22 * imgPerCss(), bbox(r).h * 0.18);
+  function rotHandleAnchor(r) {
+    const b = bbox(r);
+    return toWorld(r, { x: b.x + b.w / 2, y: b.y });
+  }
+  function rotHandlePoint(r) {
+    const b = bbox(r);
+    return toWorld(r, { x: b.x + b.w / 2, y: b.y - rotArm(r) });
+  }
 
   /* ================= 操作 ================= */
   function toImg(e) {
@@ -495,20 +672,43 @@
     return cropRect().w / Math.max(1, rect.width);
   }
 
+  /* ブラシは外接矩形ではなく，なぞった線そのものに当たったかで判定する */
+  function hitBrush(r, p) {
+    const rr = r.r * r.r;
+    const pts = r.pts;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[i + 1] || a;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const L = dx * dx + dy * dy;
+      let t = L ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / L : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const qx = a.x + dx * t - p.x, qy = a.y + dy * t - p.y;
+      if (qx * qx + qy * qy <= rr) return true;
+    }
+    return false;
+  }
+
   function hitRegion(p) {
     for (let i = S.regions.length - 1; i >= 0; i--) {
-      const r = S.regions[i], b = bbox(r);
+      const r = S.regions[i];
+      if (r.shape === 'brush') {
+        if (hitBrush(r, p)) return r;
+        continue;
+      }
+      const b = bbox(r), q = toLocal(r, p);   // 回した前の位置で当たりを見る
       if (r.shape === 'ellipse') {
-        const dx = (p.x - (b.x + b.w / 2)) / (b.w / 2), dy = (p.y - (b.y + b.h / 2)) / (b.h / 2);
+        const dx = (q.x - (b.x + b.w / 2)) / (b.w / 2), dy = (q.y - (b.y + b.h / 2)) / (b.h / 2);
         if (dx * dx + dy * dy <= 1.04) return r;
-      } else if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) return r;
+      } else if (q.x >= b.x && q.x <= b.x + b.w && q.y >= b.y && q.y <= b.y + b.h) return r;
     }
     return null;
   }
-  function hitHandle(p, b) {
+  function hitHandle(p, r) {
     const tol = 13 * imgPerCss();
-    for (const c of corners(b)) {
-      if (Math.abs(p.x - c.x) <= tol && Math.abs(p.y - c.y) <= tol) return c.id;
+    const rp = rotHandlePoint(r);
+    if (Math.hypot(p.x - rp.x, p.y - rp.y) <= tol) return 'rot';
+    for (const c of handlePoints(r)) {
+      if (Math.hypot(p.x - c.x, p.y - c.y) <= tol) return c.id;
     }
     return null;
   }
@@ -522,11 +722,33 @@
   el.overlay.addEventListener('pointerup', onUp);
   el.overlay.addEventListener('pointercancel', onUp);
 
+  /* 指やペンでの長おしも，右クリックと同じメニューにする */
+  let holdTimer = null, holdFrom = null;
+  function cancelHold() { clearTimeout(holdTimer); holdTimer = null; holdFrom = null; }
+  function armHold(e) {
+    cancelHold();
+    if (e.pointerType === 'mouse' || S.tool === 'crop') return;
+    holdFrom = { x: e.clientX, y: e.clientY };
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      // 長おしのあいだに描きはじめていたものは，なかったことにする
+      if (drag && drag.mode === 'brush') S.regions = S.regions.filter(r => r !== drag.region);
+      drag = null;
+      pointers.clear();
+      if (navigator.vibrate) navigator.vibrate(12);
+      openMenuAt(e);
+      render();
+    }, 480);
+  }
+
   function onDown(e) {
     if (!S.img) return;
+    if (!el.ctxMenu.hidden) hideMenu();
+    if (e.button === 2) return;          // 右クリックは contextmenu にまかせる
     pointers.set(e.pointerId, e);
-    if (pointers.size === 2) { startPinch(); drag = null; return; }
-    if (pointers.size > 2) return;
+    armHold(e);
+    if (pointers.size === 2) { cancelHold(); startPinch(); drag = null; return; }
+    if (pointers.size > 2) { cancelHold(); return; }
     if (e.pointerType === 'mouse' && (e.button === 1 || e.shiftKey)) {
       drag = { mode: 'pan', sx: e.clientX, sy: e.clientY, tx: V.tx, ty: V.ty };
       el.overlay.setPointerCapture(e.pointerId);
@@ -563,7 +785,13 @@
     // rect / ellipse
     const sel = S.selected ? getRegion(S.selected) : null;
     if (sel && sel.shape !== 'brush') {
-      const h = hitHandle(p, bbox(sel));
+      const h = hitHandle(p, sel);
+      if (h === 'rot') {
+        const c = centerOf(sel);
+        drag = { mode: 'rotate', region: sel, cx: c.x, cy: c.y,
+          base: rotOf(sel), from: Math.atan2(p.y - c.y, p.x - c.x) };
+        return;
+      }
       if (h) { drag = { mode: 'resize', region: sel, handle: h, start: bbox(sel) }; return; }
     }
     const hitR = hitRegion(p);
@@ -583,6 +811,7 @@
 
   function onMove(e) {
     if (!S.img) return;
+    if (holdFrom && Math.hypot(e.clientX - holdFrom.x, e.clientY - holdFrom.y) > 9) cancelHold();
     if (pointers.has(e.pointerId)) pointers.set(e.pointerId, e);
     if (pointers.size === 2 && pinch) { movePinch(); return; }
     if (!drag) return;
@@ -597,8 +826,9 @@
     if (drag.mode === 'cropMove' || drag.mode === 'cropResize' || drag.mode === 'cropCreate') { moveCropDrag(p); return; }
 
     if (drag.mode === 'brush') {
+      // 指先をこまかく追いかけて，なぞったところだけを範囲にする
       const pts = drag.region.pts, last = pts[pts.length - 1];
-      const min = drag.region.r * 0.35;
+      const min = Math.max(0.5, drag.region.r * 0.22);
       if (Math.hypot(p.x - last.x, p.y - last.y) > min) { pts.push(p); scheduleRender(); }
       return;
     }
@@ -614,16 +844,34 @@
       drag.region.w = b.w; drag.region.h = b.h;
       scheduleRender(); return;
     }
+    if (drag.mode === 'rotate') {
+      const now = Math.atan2(p.y - drag.cy, p.x - drag.cx);
+      let a = drag.base + (now - drag.from);
+      // Shiftを押している間は15度きざみにそろえる
+      if (e.shiftKey) { const step = Math.PI / 12; a = Math.round(a / step) * step; }
+      drag.region.rot = a;
+      scheduleRender(); return;
+    }
     if (drag.mode === 'resize') {
       const s = drag.start, r = drag.region, h = drag.handle;
+      // つまみは回した前の座標で動かし，中心がずれないように置きなおす
+      const q = toLocal(r, p);
       let x0 = s.x, y0 = s.y, x1 = s.x + s.w, y1 = s.y + s.h;
-      if (h.indexOf('w') >= 0) x0 = p.x;
-      if (h.indexOf('e') >= 0) x1 = p.x;
-      if (h.indexOf('n') >= 0) y0 = p.y;
-      if (h.indexOf('s') >= 0) y1 = p.y;
+      if (h.indexOf('w') >= 0) x0 = q.x;
+      if (h.indexOf('e') >= 0) x1 = q.x;
+      if (h.indexOf('n') >= 0) y0 = q.y;
+      if (h.indexOf('s') >= 0) y1 = q.y;
       const min = 8 * imgPerCss();
-      r.x = Math.min(x0, x1); r.y = Math.min(y0, y1);
-      r.w = Math.max(min, Math.abs(x1 - x0)); r.h = Math.max(min, Math.abs(y1 - y0));
+      const nx = Math.min(x0, x1), ny = Math.min(y0, y1);
+      const nw = Math.max(min, Math.abs(x1 - x0)), nh = Math.max(min, Math.abs(y1 - y0));
+      if (rotOf(r)) {
+        // 回っているときは，回した前の中心の動きを画面の動きに直してから当てる
+        const d = toWorld(r, { x: nx + nw / 2, y: ny + nh / 2 });
+        r.w = nw; r.h = nh;
+        r.x = d.x - nw / 2; r.y = d.y - nh / 2;
+      } else {
+        r.x = nx; r.y = ny; r.w = nw; r.h = nh;
+      }
       scheduleRender(); return;
     }
     if (drag.mode === 'create') {
@@ -634,6 +882,7 @@
   }
 
   function onUp(e) {
+    cancelHold();
     pointers.delete(e.pointerId);
     if (pointers.size < 2) pinch = null;
     if (!drag) return;
@@ -651,10 +900,7 @@
       }
       render(); pushHistory(); return;
     }
-    if (d.mode === 'brush' && d.region.pts.length < 1) {
-      S.regions = S.regions.filter(x => x !== d.region);
-    }
-    if (['brush', 'move', 'moveBrush', 'resize'].indexOf(d.mode) >= 0) {
+    if (['brush', 'move', 'moveBrush', 'resize', 'rotate'].indexOf(d.mode) >= 0) {
       if (d.region && d.region.shape !== 'brush') normalize(d.region);
       if (d.region && d.region.id === S.selected) captureSizeBase(d.region);
       render(); pushHistory(); return;
@@ -703,7 +949,6 @@
   /* ================= 切り抜き ================= */
   function startCropDrag(p) {
     const d = S.cropDraft;
-    const k = 1;
     const b = { x: d.x, y: d.y, w: d.w, h: d.h };
     const h = hitHandle(p, b);
     if (h) { drag = { mode: 'cropResize', handle: h, start: Object.assign({}, d) }; return; }
@@ -813,7 +1058,7 @@
 
   function syncEffectUI(r) {
     S.effect = r.effect; S.strength = r.strength;
-    el.rngStrength.value = r.strength; el.outStrength.value = r.strength;
+    el.rngStrength.value = r.strength;
     const e = MosaicEffects.byId(r.effect);
     if (e && e.cat !== S.cat) { S.cat = e.cat; buildCatTabs(); }
     buildThumbs();
@@ -831,7 +1076,6 @@
     });
   }
 
-  let thumbSrc = null;
   function makeThumbSource() {
     if (!S.img) return null;
     let sx, sy, sw;
@@ -853,19 +1097,18 @@
 
   function buildThumbs() {
     if (!S.img) return;
-    thumbSrc = makeThumbSource();
+    const thumbSrc = makeThumbSource();
     el.fxStrip.innerHTML = '';
     MosaicEffects.list.filter(e => e.cat === S.cat).forEach(e => {
       const wrap = document.createElement('button');
       wrap.className = 'fx' + (e.id === S.effect ? ' active' : '');
       wrap.title = e.name;
+      wrap.setAttribute('aria-label', e.name);
       const c = mk(64, 64);
       const cc = c.getContext('2d', { willReadFrequently: true });
       cc.drawImage(thumbSrc, 0, 0);
       try { MosaicEffects.apply(e.id, cc, 64, 64, 55); } catch (err) { }
-      const label = document.createElement('span');
-      label.textContent = e.name;
-      wrap.appendChild(c); wrap.appendChild(label);
+      wrap.appendChild(c);
       wrap.addEventListener('click', () => applyEffectChoice(e.id));
       el.fxStrip.appendChild(wrap);
     });
@@ -888,44 +1131,54 @@
 
   el.rngStrength.addEventListener('input', () => {
     S.strength = +el.rngStrength.value;
-    el.outStrength.value = S.strength;
     if (S.selected) { const r = getRegion(S.selected); if (r) r.strength = S.strength; }
     else S.regions.forEach(r => { r.strength = S.strength; });
     scheduleRender();
   });
   el.rngStrength.addEventListener('change', () => { pushHistory(); buildThumbs(); });
 
-  el.rngBrush.addEventListener('input', () => { S.brush = +el.rngBrush.value; el.outBrush.value = S.brush; });
+  el.rngBrush.addEventListener('input', () => { S.brush = +el.rngBrush.value; });
 
-  el.chkAuto.addEventListener('change', async () => {
-    S.autoMode = el.chkAuto.checked;
-    el.autoSub.classList.toggle('off', !S.autoMode);
-    el.textSub.classList.toggle('off', !S.autoMode);
-    el.btnRedetect.disabled = !S.autoMode;
-    if (S.autoMode && S.img) await detectFaces(false);
-    else if (!S.autoMode) toast('手動モード：これまでの加工はそのまま編集できます');
-  });
-  el.btnRedetect.addEventListener('click', () => detectFaces(false));
-
-  el.chkText.addEventListener('change', async () => {
+  /* ---- 自動でかくす ---- */
+  el.btnAuto.addEventListener('click', async () => {
+    S.autoFace = !S.autoFace;
+    el.btnAuto.classList.toggle('on', S.autoFace);
     if (!S.img) return;
-    if (el.chkText.checked) {
-      const n = await detectText();
-      render(); pushHistory(); buildThumbs(); unbusy();
-      toast(n ? '文字' + n + 'か所をぼかしました' : '文字らしい場所は見つかりませんでした');
-    } else {
-      const before = S.regions.length;
-      S.regions = S.regions.filter(r => r.kind !== 'text');
-      if (S.selected && !getRegion(S.selected)) S.selected = null;
+    if (S.autoFace) await runDetect(false);
+    else {
+      const n = dropKind('face');
       render(); pushHistory(); buildThumbs();
-      if (before !== S.regions.length) toast('文字のぼかしを外しました');
+      if (n) toast('顔のかくしを外しました');
     }
   });
-  el.selTextLevel.addEventListener('change', async () => {
-    if (!S.img || !el.chkText.checked) return;
-    const n = await detectText();
-    render(); pushHistory(); buildThumbs(); unbusy();
-    toast(n ? '文字' + n + 'か所をぼかしました' : '文字らしい場所は見つかりませんでした');
+
+  el.btnText.addEventListener('click', async () => {
+    S.autoText = !S.autoText;
+    el.btnText.classList.toggle('on', S.autoText);
+    if (!S.img) return;
+    if (S.autoText) {
+      const n = await detectText(LV[S.level]);
+      render(); pushHistory(); buildThumbs(); unbusy();
+      toast(n ? '文字' + n + 'か所をかくしました' : '文字らしい場所はありませんでした');
+    } else {
+      const n = dropKind('text');
+      render(); pushHistory(); buildThumbs();
+      if (n) toast('文字のかくしを外しました');
+    }
+  });
+
+  el.lvlSeg.querySelectorAll('.seg-btn').forEach(b => b.addEventListener('click', async () => {
+    if (b.classList.contains('active')) return;
+    el.lvlSeg.querySelectorAll('.seg-btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    S.level = +b.dataset.lvl;
+    if (S.img && (S.autoFace || S.autoText)) await runDetect(false);
+  }));
+
+  el.btnRedetect.addEventListener('click', async () => {
+    if (!S.img) return;
+    if (!S.autoFace && !S.autoText) { toast('顔か文字をオンにしてください'); return; }
+    await runDetect(false);
   });
 
   el.btnClear.addEventListener('click', () => {
@@ -956,17 +1209,125 @@
 
   document.addEventListener('keydown', e => {
     if (!S.img) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    const key = e.key.toLowerCase();
+    const cmd = e.ctrlKey || e.metaKey;
+    if (cmd && key === 'z') {
       e.preventDefault();
       if (e.shiftKey) { if (S.hi < S.history.length - 1) restore(S.hi + 1); }
       else if (S.hi > 0) restore(S.hi - 1);
+      return;
     }
+    if (cmd && key === 'c') { if (copyRegion()) e.preventDefault(); return; }
+    if (cmd && key === 'x') { if (copyRegion()) { e.preventDefault(); deleteSelected(); } return; }
+    if (cmd && key === 'v') { if (pasteRegion()) e.preventDefault(); return; }
+    if (cmd && key === 'd') { e.preventDefault(); duplicateSelected(); return; }
     if ((e.key === 'Delete' || e.key === 'Backspace') && S.selected) {
-      S.regions = S.regions.filter(r => r.id !== S.selected);
-      S.selected = null; render(); pushHistory();
+      e.preventDefault(); deleteSelected(); return;
     }
-    if (e.key === 'Escape') { S.selected = null; render(); }
+    if (e.key === 'Escape') { hideMenu(); S.selected = null; render(); }
   });
+
+  /* ================= コピー・貼り付け・複製 ================= */
+  let clipRegion = null;
+
+  /* 中身を丸ごと写しとる。点の配列も別物にしておく */
+  function cloneRegion(r) {
+    const c = Object.assign({}, r);
+    if (r.pts) c.pts = r.pts.map(p => ({ x: p.x, y: p.y }));
+    return c;
+  }
+
+  function placeCopy(src, shift) {
+    const r = cloneRegion(src);
+    r.id = S.nextId++;
+    r.auto = false;
+    delete r.kind;          // 自動でかけたものの写しは，手でつくったものとして扱う
+    if (r.pts) r.pts.forEach(p => { p.x += shift; p.y += shift; });
+    else { r.x += shift; r.y += shift; }
+    S.regions.push(r);
+    S.selected = r.id;
+    syncEffectUI(r);
+    render(); pushHistory(); buildThumbs();
+    return r;
+  }
+
+  const shiftStep = () => Math.max(6, Math.round(Math.min(S.img.width, S.img.height) * 0.03));
+
+  function copyRegion() {
+    const r = S.selected ? getRegion(S.selected) : null;
+    if (!r) return false;
+    clipRegion = cloneRegion(r);
+    toast('コピーしました');
+    return true;
+  }
+
+  function pasteRegion() {
+    if (!clipRegion || !S.img) return false;
+    placeCopy(clipRegion, shiftStep());
+    toast('貼り付けました');
+    return true;
+  }
+
+  function duplicateSelected() {
+    const r = S.selected ? getRegion(S.selected) : null;
+    if (!r) return false;
+    placeCopy(r, shiftStep());
+    toast('複製しました');
+    return true;
+  }
+
+  function deleteSelected() {
+    if (!S.selected) return false;
+    S.regions = S.regions.filter(r => r.id !== S.selected);
+    S.selected = null;
+    render(); pushHistory(); buildThumbs();
+    return true;
+  }
+
+  /* ---- 右クリック（端末では長おし）のメニュー ---- */
+  function hideMenu() { el.ctxMenu.hidden = true; }
+
+  function showMenu(clientX, clientY) {
+    const has = !!(S.selected && getRegion(S.selected));
+    el.ctxMenu.querySelectorAll('.ctx-item').forEach(b => {
+      b.disabled = b.dataset.act === 'paste' ? !clipRegion : !has;
+    });
+    el.ctxMenu.hidden = false;
+    // 画面からはみ出さない位置に置く
+    const m = el.ctxMenu.getBoundingClientRect();
+    const x = Math.min(clientX, window.innerWidth - m.width - 8);
+    const y = Math.min(clientY, window.innerHeight - m.height - 8);
+    el.ctxMenu.style.left = Math.max(8, x) + 'px';
+    el.ctxMenu.style.top = Math.max(8, y) + 'px';
+  }
+
+  /* メニューを出す前に，指や矢印の下にある範囲を選んでおく */
+  function openMenuAt(e) {
+    if (!S.img || S.tool === 'crop') return;
+    const r = hitRegion(toImg(e));
+    if (r) { S.selected = r.id; syncEffectUI(r); render(); }
+    showMenu(e.clientX, e.clientY);
+  }
+
+  // ブラウザの「名前を付けて保存」ではなく，自前のメニューを出す
+  el.overlay.addEventListener('contextmenu', e => { e.preventDefault(); openMenuAt(e); });
+  el.wrap.addEventListener('contextmenu', e => e.preventDefault());
+
+  el.ctxMenu.addEventListener('click', e => {
+    const b = e.target.closest('.ctx-item');
+    if (!b || b.disabled) return;
+    hideMenu();
+    if (b.dataset.act === 'dup') duplicateSelected();
+    else if (b.dataset.act === 'copy') copyRegion();
+    else if (b.dataset.act === 'paste') pasteRegion();
+    else if (b.dataset.act === 'del') deleteSelected();
+  });
+
+  document.addEventListener('pointerdown', e => {
+    if (!el.ctxMenu.hidden && !el.ctxMenu.contains(e.target)) hideMenu();
+  }, true);
+  window.addEventListener('scroll', hideMenu, true);
+  el.stage.addEventListener('wheel', hideMenu, { passive: true });
 
   let rzTimer;
   window.addEventListener('resize', () => {
@@ -977,10 +1338,9 @@
   /* ================= 保存 ================= */
   el.btnSave.addEventListener('click', () => {
     const cr = S.crop || { x: 0, y: 0, w: S.img.width, h: S.img.height };
-    el.saveInfo.innerHTML =
-      '画像サイズ：' + Math.round(cr.w) + ' × ' + Math.round(cr.h) + ' px<br>' +
-      'かくし範囲：' + S.regions.length + ' か所<br>' +
-      '位置情報などのExifは保存時に消去されます。';
+    el.saveInfo.textContent =
+      Math.round(cr.w) + ' × ' + Math.round(cr.h) + ' px ・ ' +
+      S.regions.length + 'か所 ・ Exif消去';
     el.btnShare.hidden = !(navigator.canShare && navigator.share);
     el.modal.hidden = false;
   });
@@ -992,16 +1352,13 @@
     b.classList.add('active');
     S.fmt = b.dataset.fmt;
     el.qualityRow.hidden = S.fmt !== 'jpeg';
-    el.fmtNote.textContent = S.fmt === 'jpeg'
-      ? '写真向き。ファイルが軽くなります。'
-      : '文字や線がくっきり。ファイルは大きめです。';
   }));
-  el.rngQuality.addEventListener('input', () => { el.outQuality.value = el.rngQuality.value; });
 
   function stamp() {
     const d = new Date(), p = n => String(n).padStart(2, '0');
     return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
+  const outName = () => 'school_' + stamp() + (S.fmt === 'png' ? '.png' : '.jpg');
 
   async function exportBlob() {
     const cr = S.crop || { x: 0, y: 0, w: S.img.width, h: S.img.height };
@@ -1022,7 +1379,7 @@
     await nextFrame();
     try {
       const blob = await exportBlob();
-      const name = 'kaokakushi_' + stamp() + (S.fmt === 'png' ? '.png' : '.jpg');
+      const name = outName();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = name;
@@ -1038,22 +1395,37 @@
     await nextFrame();
     try {
       const blob = await exportBlob();
-      const name = 'kaokakushi_' + stamp() + (S.fmt === 'png' ? '.png' : '.jpg');
-      const file = new File([blob], name, { type: blob.type });
+      const file = new File([blob], outName(), { type: blob.type });
       unbusy();
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: name });
+        await navigator.share({ files: [file], title: file.name });
       } else toast('この端末では共有できません');
     } catch (e) { unbusy(); }
   });
 
   /* ================= 初期化 ================= */
   buildCatTabs();
-  el.outStrength.value = S.strength;
-  el.outBrush.value = S.brush;
-  el.outQuality.value = el.rngQuality.value;
+  el.rngStrength.value = S.strength;
+  el.rngBrush.value = S.brush;
   syncTools();
   window.addEventListener('beforeunload', e => {
     if (S.img && S.regions.length) { e.preventDefault(); e.returnValue = ''; }
   });
+
+  /* 開発中の自動テスト用の窓口。手元（localhost）でだけ開く。
+     公開したページでは中身を外に出さない。 */
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+    const toClient = p => {
+      const rect = el.overlay.getBoundingClientRect(), cr = cropRect();
+      return { x: rect.left + (p.x - cr.x) / cr.w * rect.width,
+               y: rect.top + (p.y - cr.y) / cr.h * rect.height };
+    };
+    window.__S = S;
+    window.__exportBlob = exportBlob;
+    window.__centerClient = () => toClient(centerOf(getRegion(S.selected)));
+    window.__rotHandleClient = () => {
+      const r = getRegion(S.selected);
+      return r && r.shape !== 'brush' ? toClient(rotHandlePoint(r)) : null;
+    };
+  }
 })();
