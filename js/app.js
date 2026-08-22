@@ -1205,9 +1205,41 @@
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) openFile(f);
   });
+  /* クリップボードから写真を取り出す。
+     Windowsの Win+Shift+S でとったスクショ，スマホのスクショ，
+     ほかのページからコピーした画像は，どれもここに file の形で入っている。 */
+  function imageFromClipboard(e) {
+    const d = e.clipboardData;
+    if (!d) return null;
+    if (d.files) for (const f of d.files) if (f && /^image\//.test(f.type)) return f;
+    if (d.items) for (const it of d.items) {
+      if (it.kind === 'file' && /^image\//.test(it.type)) {
+        const f = it.getAsFile();
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+
+  /* Ctrl+V には二つの意味がある。
+     クリップボードに写真が入っていれば，その写真を開く。
+     入っていなければ，コピーしておいた範囲を貼り付ける。
+     どちらなのかは，paste の出来事が来るまで分からない。そこで keydown では
+     決めずに待ち，写真でなかったときだけ範囲の貼り付けに回す。
+
+     ここで keydown を止めてはいけない。止めるとブラウザが paste の出来事を
+     出さなくなり，クリップボードの写真を受け取るすべがなくなる。
+     （前は止めていたので，一度でも範囲をコピーすると，
+       そのあとスクショを貼れなくなっていた。） */
+  let wantRegionPaste = false;
+
   document.addEventListener('paste', e => {
-    const items = e.clipboardData && e.clipboardData.files;
-    if (items && items[0]) openFile(items[0]);
+    if (!el.modal.hidden) return;          // 保存の窓が開いている間は何もしない
+    const f = imageFromClipboard(e);
+    if (!f) return;                        // 写真でなければ範囲の貼り付けにゆずる
+    wantRegionPaste = false;
+    e.preventDefault();
+    openFile(f);
   });
 
   document.addEventListener('keydown', e => {
@@ -1222,7 +1254,18 @@
     }
     if (cmd && key === 'c') { if (copyRegion()) e.preventDefault(); return; }
     if (cmd && key === 'x') { if (copyRegion()) { e.preventDefault(); deleteSelected(); } return; }
-    if (cmd && key === 'v') { if (pasteRegion()) e.preventDefault(); return; }
+    if (cmd && key === 'v') {
+      wantRegionPaste = true;
+      /* paste の出来事は，この直後に来る。それを見送ってから決める。
+         クリップボードの読み出しはブラウザの中で少し遅れて届くことがあるので，
+         ほんの少しだけ待つ。人の目には分からない長さである。 */
+      setTimeout(() => {
+        if (!wantRegionPaste) return;
+        wantRegionPaste = false;
+        pasteRegion();
+      }, 50);
+      return;
+    }
     if (cmd && key === 'd') { e.preventDefault(); duplicateSelected(); return; }
     if ((e.key === 'Delete' || e.key === 'Backspace') && S.selected) {
       e.preventDefault(); deleteSelected(); return;
