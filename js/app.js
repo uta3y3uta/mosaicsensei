@@ -1233,27 +1233,68 @@
        そのあとスクショを貼れなくなっていた。） */
   let wantRegionPaste = false;
 
+  /* どちらを優先するかは「あとからコピーしたほう」で決める。
+     範囲をコピーしたときに，端末のクリップボードにもこの印を置くので，
+     前にとったスクショが居すわることはない。 */
+  const CLIP_MARK = '［モザイク先生］かくす範囲をコピーしました';
+
+  /* 印を置けなかったとき（file:// で開いたときなど）のための備え。
+     同じ写真をもう一度見せられただけなら，クリップボードは入れかわっていない。 */
+  let lastImageKey = null;        // 最後に見たクリップボードの写真の見分け札
+  let regionIsNewest = false;     // いま新しいのは範囲のほうか
+  let regionCopiedAfter = null;   // 範囲をコピーした時点で見えていた写真
+  let copiedAt = 0;               // 範囲をコピーした時こく
+
+  /* 同じ写真かどうかの見分け札。
+     貼るたびに新しく作られる値（時こくなど）は，同じ写真でも変わってしまうので使わない。 */
+  const imageKey = f => f.size + '/' + f.type + '/' + (f.name || '');
+
   document.addEventListener('paste', e => {
     if (!el.modal.hidden) return;          // 保存の窓が開いている間は何もしない
+    const d = e.clipboardData;
+    // 自分で置いた印なら，新しいのは範囲のほう。範囲の貼り付けにゆずる
+    if (d && (d.getData('text/plain') || '').indexOf(CLIP_MARK) === 0) return;
     const f = imageFromClipboard(e);
     if (!f) return;                        // 写真でなければ範囲の貼り付けにゆずる
+    const key = imageKey(f);
+    const stale = regionIsNewest && clipRegion && key === regionCopiedAfter;
+    lastImageKey = key;
+    if (stale) return;                     // 前と同じ写真。あとからコピーした範囲を優先する
+    regionIsNewest = false;
     wantRegionPaste = false;
     e.preventDefault();
     openFile(f);
   });
 
+  /* Ctrl+C のとき，ブラウザが出す copy の出来事に相乗りして印を置く。
+     この道なら通信もいらず，file:// で開いたときでも確実に置ける。 */
+  const markCopy = e => {
+    if (!clipRegion || !e.clipboardData) return;
+    if (Date.now() - copiedAt > 1000) return;   // いま範囲をコピーしたときだけ
+    const sel = window.getSelection();
+    if (sel && String(sel).length) return;      // 文字を選んでいるときはじゃましない
+    e.clipboardData.setData('text/plain', CLIP_MARK);
+    e.preventDefault();
+  };
+  document.addEventListener('copy', markCopy);
+  document.addEventListener('cut', markCopy);
+
   document.addEventListener('keydown', e => {
     if (!S.img) return;
     const key = e.key.toLowerCase();
     const cmd = e.ctrlKey || e.metaKey;
-    if (cmd && key === 'z') {
+    /* 元に戻す・やり直す。
+       やり直しは Ctrl+Shift+Z と Ctrl+Y のどちらでもできる。 */
+    if (cmd && (key === 'z' || key === 'y')) {
       e.preventDefault();
-      if (e.shiftKey) { if (S.hi < S.history.length - 1) restore(S.hi + 1); }
+      if (key === 'y' || e.shiftKey) { if (S.hi < S.history.length - 1) restore(S.hi + 1); }
       else if (S.hi > 0) restore(S.hi - 1);
       return;
     }
-    if (cmd && key === 'c') { if (copyRegion()) e.preventDefault(); return; }
-    if (cmd && key === 'x') { if (copyRegion()) { e.preventDefault(); deleteSelected(); } return; }
+    /* ここで止めてはいけない。止めると copy／cut の出来事が出なくなり，
+       端末のクリップボードに印を置けなくなる。 */
+    if (cmd && key === 'c') { copyRegion(); return; }
+    if (cmd && key === 'x') { if (copyRegion()) deleteSelected(); return; }
     if (cmd && key === 'v') {
       wantRegionPaste = true;
       /* paste の出来事は，この直後に来る。それを見送ってから決める。
@@ -1303,6 +1344,15 @@
     const r = S.selected ? getRegion(S.selected) : null;
     if (!r) return false;
     clipRegion = cloneRegion(r);
+    /* いちばん新しいコピーは，この範囲である，と覚えておく。
+       端末のクリップボードにも印を置きにいく（copy の出来事が出ないときの備え）。 */
+    regionIsNewest = true;
+    regionCopiedAfter = lastImageKey;
+    copiedAt = Date.now();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText)
+        navigator.clipboard.writeText(CLIP_MARK).catch(() => {});
+    } catch (err) { /* 使えない端末では，上の覚えだけでしのぐ */ }
     toast('コピーしました');
     return true;
   }
