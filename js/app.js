@@ -43,8 +43,11 @@
 
   const S = {
     img: null, crop: null, regions: [], nextId: 1,
-    autoFace: true, autoText: true, level: 2,
-    tool: 'rect', effect: 'square', strength: 45, brush: 40,
+    /* はじめは「顔だけ・弱・ブラシ」。
+       文字さがしは，名札のほかに掲示物なども拾うことがあるので，
+       必要なときに使う人が自分でオンにする。 */
+    autoFace: true, autoText: false, level: 1,
+    tool: 'brush', effect: 'square', strength: 45, brush: 40,
     selected: null, cat: 'モザイク',
     cropDraft: null, ratio: 'free',
     history: [], hi: -1,
@@ -132,7 +135,7 @@
     if (src.close) src.close();
 
     S.img = c; S.crop = null; S.regions = []; S.nextId = 1; S.selected = null;
-    S.tool = 'rect'; S.cropDraft = null;
+    S.tool = 'brush'; S.cropDraft = null;
     S.history = []; S.hi = -1;
     V.z = 1; V.tx = 0; V.ty = 0;
 

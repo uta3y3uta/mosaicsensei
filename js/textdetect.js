@@ -1,12 +1,28 @@
-/* 文字が書かれた領域（名札・ネームカード・背景の掲示物など）をさがす。
+/* 「名前が書かれた札」をさがす。
    AIモデルを使わない古典的な画像処理なので，追加のダウンロードも通信も発生しない。
+
+   ねらいは名札・ネームカードにしぼること。
+   木の葉・砂利・れんが・服のしま模様・髪の毛といった細かい模様は，
+   輪郭だけ見ると文字とよく似ている。そこで「文字らしさ」だけでなく
+   「札らしさ」も確かめる。札には次の特徴がある。
+
+     ・地の色が広くて，むらがない（紙やプレートだから）
+     ・その上に，はっきり濃さのちがう印（＝文字）がのっている
+     ・印は地に対して少数派である
+     ・書いてあるのは名前なので，字数が少なく，細長くなりすぎない
+     ・写真全体から見ると小さい
+
+   これらを満たさないものは落とす。さらに最後に，
+   画面のうちかくす割合に上限を設けて，
+   なにかの拍子に画面全体がつぶれることがないようにしている。
 
    流れ：
      形態学的勾配 → Otsu二値化 → 縦横のクロージングで文字を行のかたまりにまとめる
      → 連結成分のうち「文字らしい形と密度」のものを残す
-     → 名札の余白と枠線まで広げる（カード全体をかくすため）
      → 同じ行・同じ列に並ぶものをつないで，苗字と名前が離れていても1つにする
-   さらに複数の解像度で走らせるので，遠くの小さな名札や一文字だけの名札も拾える。 */
+     → 札のふちまで広げる
+     → 「札らしさ」で確かめる（ここでほとんどの誤検出が落ちる）
+     → 名前らしい順にならべ，決めた割合まで採る */
 window.TextDetect = (function () {
   'use strict';
 
@@ -16,19 +32,36 @@ window.TextDetect = (function () {
   /* scales: 基準の何倍の解像度で走らせるか。大きいほど小さな文字が見つかる。
      trans: 走査線上で線が切り替わる回数の下限。文字は画数があるので大きい。
      grow: 名札のふちをさがしに，外へ何歩まで見にいくか（かたまりの短辺の倍率）。
-           大きくしすぎると，となりの掲示物のふちまで飲みこんでしまう。 */
+
+     ここから下が「札らしさ」の関門。
+     contrast: 地と印の明るさの差の下限。模様はここが小さい。
+     paperFlat: 同じ色の地が最低これだけ広いこと。木の葉や砂利はここが小さい。
+     inkLo/Hi: 印が占める割合。文字なら地のほうが多い。
+     maxSide/maxArea: 写真に対する大きさの上限。
+     maxCover: 画面のうちかくしてよい割合の合計。
+     txCard: 札の中で線が切りかわる回数の下限。字は画数があるので大きく，
+             水玉・粒・光の点は小さい。 */
   const LEVELS = {
     low: {
       fill: 0.30, minSide: 11, minPx: 8, rawLo: 0.045, rawHi: 0.74,
-      elong: 1.05, trans: 2.1, scales: [1], grow: 0.9
+      elong: 1.05, trans: 2.1, scales: [1, 1.4], grow: 0.9,
+      contrast: 62, paperFlat: 0.34, paperMin: 150, inkLo: 0.05, inkHi: 0.38,
+      maxAspect: 6.0, maxSide: 0.26, maxArea: 0.030, maxCover: 0.12,
+      txCard: 2.6
     },
     mid: {
       fill: 0.22, minSide: 8, minPx: 7, rawLo: 0.032, rawHi: 0.84,
-      elong: 1.00, trans: 1.9, scales: [1, 1.4], grow: 0.9
+      elong: 1.00, trans: 1.9, scales: [1, 1.4], grow: 0.9,
+      contrast: 50, paperFlat: 0.26, paperMin: 135, inkLo: 0.04, inkHi: 0.44,
+      maxAspect: 7.0, maxSide: 0.32, maxArea: 0.042, maxCover: 0.18,
+      txCard: 2.1
     },
     high: {
       fill: 0.14, minSide: 6, minPx: 5, rawLo: 0.022, rawHi: 0.92,
-      elong: 1.00, trans: 1.4, scales: [1, 1.4, 1.9], grow: 0.9
+      elong: 1.00, trans: 1.4, scales: [1, 1.4, 1.9], grow: 0.9,
+      contrast: 38, paperFlat: 0.18, paperMin: 115, inkLo: 0.03, inkHi: 0.52,
+      maxAspect: 9.0, maxSide: 0.40, maxArea: 0.060, maxCover: 0.25,
+      txCard: 1.7
     }
   };
 
@@ -166,6 +199,119 @@ window.TextDetect = (function () {
     return b;
   }
 
+  /* 文字のある行（縦書きなら列）だけを見て，線の切りかわり回数を測る。
+     transitions() を四角ぜんぶに使うと，札の余白のぶんだけ数字が薄まって，
+     一文字だけの名札が「画数が足りない」と誤って落ちてしまう。 */
+  function strokeTx(raw, w, bx, by, bw, bh) {
+    let rowSum = 0, rowN = 0, colSum = 0, colN = 0;
+    for (let y = by; y < by + bh; y++) {
+      const o = y * w;
+      let n = 0, prev = 0;
+      for (let x = bx; x < bx + bw; x++) {
+        const v = raw[o + x];
+        if (v && !prev) n++;
+        prev = v;
+      }
+      if (n) { rowSum += n; rowN++; }
+    }
+    for (let x = bx; x < bx + bw; x++) {
+      let n = 0, prev = 0;
+      for (let y = by; y < by + bh; y++) {
+        const v = raw[y * w + x];
+        if (v && !prev) n++;
+        prev = v;
+      }
+      if (n) { colSum += n; colN++; }
+    }
+    return Math.max(rowN ? rowSum / rowN : 0, colN ? colSum / colN : 0);
+  }
+
+  /* ---- 札らしさを確かめる ----
+     切り出した四角の中を，明るさで「地」と「印」の2つに分ける。
+     名札なら，地が広くてむらがなく，印ははっきり濃さがちがって少数派になる。
+     木の葉・砂利・しま模様は，地と印の差が小さいか，地がざらついているので落ちる。
+
+     戻り値は名前らしさの点数（大きいほど名前らしい）。0以下なら落とす。 */
+  function cardScore(g, raw, w, h, bx, by, bw, bh, cfg) {
+    const total = bw * bh;
+    if (total < 16) return 0;
+
+    // 中の明るさのヒストグラムから，地と印の境目を決める
+    const hist = new Int32Array(256);
+    for (let y = by; y < by + bh; y++) {
+      const o = y * w;
+      for (let x = bx; x < bx + bw; x++) hist[g[o + x]]++;
+    }
+    let sum = 0;
+    for (let t = 0; t < 256; t++) sum += t * hist[t];
+    let sumB = 0, wB = 0, best = 0, thr = 128;
+    for (let t = 0; t < 256; t++) {
+      wB += hist[t];
+      if (!wB) continue;
+      const wF = total - wB;
+      if (!wF) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB, mF = (sum - sumB) / wF;
+      const v = wB * wF * (mB - mF) * (mB - mF);
+      if (v > best) { best = v; thr = t; }
+    }
+
+    // 暗い側と明るい側の，数・平均・ちらばり
+    let nD = 0, sD = 0, qD = 0, nL = 0, sL = 0, qL = 0;
+    for (let t = 0; t <= thr; t++) { nD += hist[t]; sD += t * hist[t]; qD += t * t * hist[t]; }
+    for (let t = thr + 1; t < 256; t++) { nL += hist[t]; sL += t * hist[t]; qL += t * t * hist[t]; }
+    if (!nD || !nL) return 0;
+    const mD = sD / nD, mL = sL / nL;
+    const contrast = mL - mD;
+    if (contrast < cfg.contrast) return 0;
+
+    // 少ないほうが「印（文字）」，多いほうが「地（紙）」
+    const inkDark = nD <= nL;
+    const inkRatio = (inkDark ? nD : nL) / total;
+    if (inkRatio < cfg.inkLo || inkRatio > cfg.inkHi) return 0;
+
+    /* 名札は「明るい地に，暗い字」である。白い紙・白いプレートに黒で書く。
+       この向きを決めておくと，水玉のシャツ・しま模様の服・木もれ日のように
+       「暗い地に，明るい点」が並ぶものが，ここでまとめて落ちる。
+       濃い色の札に白い字，というものは学校ではまず使わないので，
+       取りこぼしよりも，画面がつぶれないことを選ぶ。 */
+    if (!inkDark) return 0;
+    if (mL < cfg.paperMin) return 0;
+
+    /* 地が「一色」であることを確かめる。
+       紙やプレートは，ほとんど同じ明るさの面が広がっている。
+       木の葉・砂利・れんが・服のしまは，明るいほうの画素もばらばらの明るさをもつ。
+
+       ここをちらばり（標準偏差や四分位範囲）で測ってはいけない。
+       字のふちは，写真を小さくしたときに中間の色ににじむ。そのにじみも
+       「地」の仲間に数えられるので，まっ白な紙でも数字が大きく出てしまう。
+       そこで「散らばりの小ささ」ではなく「同じ色がどれだけ広いか」で測る。
+       にじみは少数派なので，広さで測ればじゃまをしない。 */
+    const nP = inkDark ? nL : nD;
+    const lo = inkDark ? thr + 1 : 0;
+    const hi = inkDark ? 255 : thr;
+    let mode = lo, modeN = -1;
+    for (let t = lo; t <= hi; t++) if (hist[t] > modeN) { modeN = hist[t]; mode = t; }
+    let flatN = 0;
+    for (let t = Math.max(0, mode - 8); t <= Math.min(255, mode + 8); t++) flatN += hist[t];
+    const flat = flatN / total;
+    if (flat < cfg.paperFlat) return 0;
+
+    /* 印が「字」であることを確かめる。
+       字は画数があるので，走査線の上で線が何度も切りかわる。
+       水玉・粒・光のあたった点は，切りかわりがほとんどないのでここで落ちる。
+       これがないと，服の模様や砂利までカードに見えてしまう。 */
+    const tx = strokeTx(raw, w, bx, by, bw, bh);
+    if (tx < cfg.txCard) return 0;
+
+    /* 名前らしさ。地が一色で広く，はっきりしていて，字数が少ないほど高い。 */
+    const aspect = bw > bh ? bw / bh : bh / bw;
+    const clean = Math.min(1, flat / 0.5);
+    const clear = Math.min(1, contrast / 120);
+    const few = 1 - Math.min(1, (aspect - 1) / (cfg.maxAspect + 1));
+    return (clean * 0.4 + clear * 0.3 + few * 0.3) * 100 * (nP / total);
+  }
+
   /* 二値画像の連結成分（8近傍）から，文字らしいものの外接矩形を集める */
   function components(bin, raw, w, h, cfg, out) {
     const seen = new Uint8Array(w * h);
@@ -280,6 +426,7 @@ window.TextDetect = (function () {
           const dup = ua <= Math.max(aa, ba) * 1.15;
           if (!dup && (u.w > maxW || u.h > maxH)) continue;
           u.u = Math.min(a.u, b.u);
+          u.score = Math.max(a.score || 0, b.score || 0);
           boxes[i] = u;
           boxes.splice(j, 1);
           changed = true;
@@ -292,7 +439,10 @@ window.TextDetect = (function () {
 
   function mergeBoxes(list, w, h) {
     const maxW = w * 0.9, maxH = h * 0.5;
-    let boxes = list.map(b => ({ x: b.x, y: b.y, w: b.w, h: b.h, u: b.u || Math.min(b.w, b.h) }));
+    let boxes = list.map(b => ({
+      x: b.x, y: b.y, w: b.w, h: b.h,
+      u: b.u || Math.min(b.w, b.h), score: b.score || 0
+    }));
     boxes = combine(boxes, nearDup, maxW, maxH, 3.0);   // 重なりの整理
     boxes = combine(boxes, sameLine, maxW, maxH, 2.2);  // 同じ行・列をつなぐ
     return boxes;
@@ -312,32 +462,115 @@ window.TextDetect = (function () {
     const raw = new Uint8Array(n);
     for (let i = 0; i < n; i++) raw[i] = grad[i] > thr ? 1 : 0;
 
-    const kw = Math.max(3, Math.round(w / 90));  // 文字を横につなぐ幅
-    const kh = Math.max(3, Math.round(h / 90));  // 縦書き用
-    const boxes = [];
+    /* 文字を1つのかたまりにまとめるために，となりあう線をつなぐ（クロージング）。
+       つなぐ幅は2通り試す。
+         広い幅：苗字と名前が離れていても1つにできる。
+         せまい幅：小さな名札が，となりのしま模様の服や砂利とくっついてしまうのを防ぐ。
+       広い幅だけだと，服の上の小さな名札が服ぜんぶと一体になり，
+       「大きすぎる」として落ちてしまう。両方やって，あとで重なりをまとめる。 */
     const bin = new Uint8Array(n);
+    const wide = [Math.max(3, Math.round(w / 90)), Math.max(3, Math.round(h / 90))];
+    const fine = [Math.max(2, Math.round(w / 260)), Math.max(2, Math.round(h / 260))];
 
-    // 横書き：横方向クロージング
-    morphH(raw, a, w, h, kw, true); morphH(a, bin, w, h, kw, false);
-    morphV(bin, a, w, h, 1, true); morphV(a, bin, w, h, 1, false);
-    components(bin, raw, w, h, cfg, boxes);
+    /* つないだかたまりを，札として確かめて出すところまで。
+       だいじなのは，つなぐ幅ごとに最後まで別々に進めること。
+       とちゅうで一緒にすると，せまい幅でうまく取れた小さな名札が，
+       広い幅で服ぜんぶをのみこんだ大きなかたまりと合体して，消えてしまう。 */
+    const emit = (boxes) => {
+      /* つないだかたまりと，つなぐ前の一つ一つの，両方を確かめる。
+         つないだものだけを見ると，たまたま近くにあった別のもの
+         （服のしま模様など）と一緒になった名札が，
+         「札らしくない」として落ちてしまう。
+         つなぐ前のものも見ておけば，その名札は単独で助かる。
+         札でないものはどのみち下の関門で落ちるので，増やしても害はない。 */
+      // 先に同じ行・列のものをつないでから，そのかたまりごとカードのふちまで広げる。
+      // 順番が逆だと，苗字と名前が別々に広がってしまい，カード全体をおおえない。
+      for (const r of mergeBoxes(boxes, w, h).concat(boxes)) {
+        const e = expandToCard(raw, w, h,
+          { minx: r.x, miny: r.y, maxx: r.x + r.w - 1, maxy: r.y + r.h - 1 }, cfg.grow);
+        const bw2 = e.maxx - e.minx + 1, bh2 = e.maxy - e.miny + 1;
 
-    // 縦書き：縦方向クロージング
-    morphV(raw, a, w, h, kh, true); morphV(a, bin, w, h, kh, false);
-    morphH(bin, a, w, h, 1, true); morphH(a, bin, w, h, 1, false);
-    components(bin, raw, w, h, cfg, boxes);
+        /* 名前は，それほど細長くならない。
+           広げたあとの四角ではなく，文字そのものの四角で見る。
+           日本語は字と字がくっつくので，「長さ÷字の高さ」がおおよその字数になる。 */
+        const aspect = r.w > r.h ? r.w / r.h : r.h / r.w;
+        if (aspect > cfg.maxAspect) continue;
 
-    // 先に同じ行・列のものをつないでから，そのかたまりごとカードのふちまで広げる。
-    // 順番が逆だと，苗字と名前が別々に広がってしまい，カード全体をおおえない。
-    for (const r of mergeBoxes(boxes, w, h)) {
-      const e = expandToCard(raw, w, h,
-        { minx: r.x, miny: r.y, maxx: r.x + r.w - 1, maxy: r.y + r.h - 1 }, cfg.grow);
-      out.push({
-        x: e.minx * scale, y: e.miny * scale,
-        w: (e.maxx - e.minx + 1) * scale, h: (e.maxy - e.miny + 1) * scale,
-        u: r.u * scale
-      });
+        /* 広げたあとの四角でも見ておく。
+           長い文の一部分を切り取ると，それだけなら名前くらいの長さに見える。
+           けれども，ふちをさがして広げていくと，となりの字までのみこんで
+           細長くなる。名札なら，カードのふちで止まるので細長くならない。 */
+        const eAspect = bw2 > bh2 ? bw2 / bh2 : bh2 / bw2;
+        if (eAspect > cfg.maxAspect) continue;
+
+        /* 札らしさは，文字のまわりを少しだけ広げたところで測る。
+           広げきった四角で測ると，札の外の景色まで「地」に入ってしまい，
+           まっ白な名札でも「むらがある」ことになってしまう。 */
+        const q = Math.max(1, Math.round(r.u * 0.3));
+        const sx = Math.max(0, r.x - q), sy = Math.max(0, r.y - q);
+        const ex = Math.min(w - 1, r.x + r.w - 1 + q), ey = Math.min(h - 1, r.y + r.h - 1 + q);
+        const score = cardScore(g, raw, w, h, sx, sy, ex - sx + 1, ey - sy + 1, cfg);
+        if (score <= 0) continue;
+
+        out.push({
+          x: e.minx * scale, y: e.miny * scale,
+          w: bw2 * scale, h: bh2 * scale,
+          u: r.u * scale, score: score
+        });
+      }
+    };
+
+    for (const [kw, kh] of [wide, fine]) {
+      const boxes = [];
+
+      // 横書き：横方向クロージング
+      morphH(raw, a, w, h, kw, true); morphH(a, bin, w, h, kw, false);
+      morphV(bin, a, w, h, 1, true); morphV(a, bin, w, h, 1, false);
+      components(bin, raw, w, h, cfg, boxes);
+
+      // 縦書き：縦方向クロージング
+      morphV(raw, a, w, h, kh, true); morphV(a, bin, w, h, kh, false);
+      morphH(bin, a, w, h, 1, true); morphH(a, bin, w, h, 1, false);
+      components(bin, raw, w, h, cfg, boxes);
+
+      emit(boxes);
     }
+  }
+
+  /* ---- 最後の関門 ----
+     名札は写真の中では小さい。大きすぎる四角は名札ではないので落とす。
+     そのうえで名前らしい順に採っていき，画面のうちかくす割合が
+     決めた上限に届いたらそこで打ち切る。
+     こうしておけば，どんな写真でも画面全体がつぶれることはない。 */
+  function limit(boxes, iw, ih, cfg) {
+    const long = Math.max(iw, ih), area = iw * ih;
+    const keep = boxes.filter(b =>
+      Math.max(b.w, b.h) <= long * cfg.maxSide && b.w * b.h <= area * cfg.maxArea);
+    keep.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    // ざっくりした重なりつきの面積を測るための粗いマス目
+    const gw = 160, gh = Math.max(1, Math.round(gw * ih / iw));
+    const mask = new Uint8Array(gw * gh);
+    const budget = gw * gh * cfg.maxCover;
+    let used = 0;
+    const out = [];
+    for (const b of keep) {
+      const x0 = Math.max(0, Math.floor(b.x / iw * gw));
+      const y0 = Math.max(0, Math.floor(b.y / ih * gh));
+      const x1 = Math.min(gw - 1, Math.ceil((b.x + b.w) / iw * gw) - 1);
+      const y1 = Math.min(gh - 1, Math.ceil((b.y + b.h) / ih * gh) - 1);
+      let add = 0;
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) if (!mask[y * gw + x]) add++;
+      }
+      if (used + add > budget && out.length) break;   // 予算ぎれ。ここまで
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) mask[y * gw + x] = 1;
+      }
+      used += add;
+      out.push(b);
+    }
+    return out;
   }
 
   /* src: 画像やcanvas / level: 'low'|'mid'|'high'
@@ -353,7 +586,14 @@ window.TextDetect = (function () {
       last = target;
       pass(src, target, cfg, out);
     }
-    return mergeBoxes(out, src.width, src.height)
+    /* 大きすぎるものは，つなぐ前に落としておく。
+       あとで落とすのでは間にあわない。つなぐと，せっかくうまく取れた
+       小さな名札が，となりの大きなはずれと合体して，一緒に消えてしまう。 */
+    const area = src.width * src.height;
+    const fit = out.filter(b =>
+      Math.max(b.w, b.h) <= long * cfg.maxSide && b.w * b.h <= area * cfg.maxArea);
+    const merged = mergeBoxes(fit, src.width, src.height);
+    return limit(merged, src.width, src.height, cfg)
       .map(b => ({ x: b.x, y: b.y, w: b.w, h: b.h }));
   }
 
