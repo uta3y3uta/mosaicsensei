@@ -1,4 +1,4 @@
-/* スクールプライバシー — すべての処理は端末内で完結します */
+/* モザイク先生 — すべての処理は端末内で完結します */
 (function () {
   'use strict';
 
@@ -1338,30 +1338,37 @@
     rzTimer = setTimeout(() => { if (S.img) { layout(); render(); } }, 120);
   });
 
-  /* ================= 保存 ================= */
-  el.btnSave.addEventListener('click', () => {
-    const cr = S.crop || { x: 0, y: 0, w: S.img.width, h: S.img.height };
-    el.saveInfo.textContent =
-      Math.round(cr.w) + ' × ' + Math.round(cr.h) + ' px ・ ' +
-      S.regions.length + 'か所 ・ Exif消去';
-    el.btnShare.hidden = !(navigator.canShare && navigator.share);
-    el.modal.hidden = false;
-  });
-  el.btnSaveCancel.addEventListener('click', () => { el.modal.hidden = true; });
-  el.modal.addEventListener('click', e => { if (e.target === el.modal) el.modal.hidden = true; });
+  /* ================= 保存 =================
+     端末によって「保存」のしかたが違う。ここを一本の道でやると，
+     どこかの端末で必ずこぼれる。
 
-  el.fmtSeg.querySelectorAll('.seg-btn').forEach(b => b.addEventListener('click', () => {
-    el.fmtSeg.querySelectorAll('.seg-btn').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    S.fmt = b.dataset.fmt;
-    el.qualityRow.hidden = S.fmt !== 'jpeg';
-  }));
+     ・iPhone・iPad の Safari は <a download> を黙って無視する。
+       押しても何も起きず，写真にも入らない。
+       あそこの「写真」へ入れる道は，共有シートの「画像を保存」だけ。
+     ・パソコン・Chromebook・Windowsタブレットの Chrome / Edge は，
+       保存先のフォルダを選ぶ窓を出せる。どこへ入ったかが目で見える。
+     ・それ以外（Android の Chrome，Firefox，Safari のパソコン版）は，
+       これまでどおりのダウンロードでフォルダに入る。
+
+     もうひとつ大事なことがある。共有シートも保存先を選ぶ窓も，
+     「いま押した」という印がついている間しか開けない。
+     途中で画像づくりを待つと，その印が消えて開けなくなる。
+     そこで，保存の窓を開けた時点で先に画像をつくっておき，
+     保存を押した瞬間には，もう渡すだけにしてある。 */
+
+  const UA = navigator.userAgent || '';
+  /* iPadOS は自分を Macintosh だと名のる。指で触れるかどうかで見分ける。 */
+  const isIOS = /iPad|iPhone|iPod/.test(UA) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const canPick = typeof window.showSaveFilePicker === 'function';
+  const canShareFile = f =>
+    !!(navigator.canShare && navigator.share && navigator.canShare({ files: [f] }));
 
   function stamp() {
     const d = new Date(), p = n => String(n).padStart(2, '0');
     return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
   }
-  const outName = () => 'school_' + stamp() + (S.fmt === 'png' ? '.png' : '.jpg');
+  const outName = () => 'mosaic_' + stamp() + (S.fmt === 'png' ? '.png' : '.jpg');
 
   async function exportBlob() {
     const cr = S.crop || { x: 0, y: 0, w: S.img.width, h: S.img.height };
@@ -1376,34 +1383,141 @@
     return await new Promise(res => out.toBlob(res, type, q));
   }
 
+  /* できあがった画像の置き場。保存を押した瞬間はここから取るだけにする。 */
+  let ready = null, readyJob = null, prepTimer = 0;
+
+  function prepare() {
+    ready = null;
+    const job = readyJob = (async () => {
+      await nextFrame();
+      const blob = await exportBlob();
+      if (readyJob !== job) return;            // もっと新しい注文が来ていた
+      if (!blob) throw new Error('no blob');
+      ready = { blob, name: outName() };
+    })();
+    job.catch(() => {});
+    return job;
+  }
+  /* かたち・画質を変えたら作りなおす。指が止まってから。 */
+  function reprepare() {
+    ready = null;
+    clearTimeout(prepTimer);
+    prepTimer = setTimeout(() => { if (!el.modal.hidden) prepare(); }, 250);
+  }
+
+  function download(blob, name) {
+    const a = document.createElement('a');
+    if (!('download' in a)) return false;
+    const url = URL.createObjectURL(blob);
+    a.href = url; a.download = name; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return true;
+  }
+
+  /* どの道も通れなかったときの最後の手。画像をそのまま開く。
+     長おしから端末に保存できる。 */
+  function openInTab(blob) {
+    const url = URL.createObjectURL(blob);
+    if (!window.open(url, '_blank')) location.href = url;
+    toast('出てきた写真を長おしして保存してください');
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  }
+
+  async function deliver(pack, late) {
+    const { blob, name } = pack;
+    const file = () => new File([blob], name, { type: blob.type });
+    try {
+      if (isIOS) {
+        const f = file();
+        if (canShareFile(f)) {
+          await navigator.share({ files: [f] });
+          toast('「画像を保存」で写真に入ります');
+          return;
+        }
+        openInTab(blob);
+        return;
+      }
+      if (canPick) {
+        const ext = S.fmt === 'png' ? '.png' : '.jpg';
+        const h = await window.showSaveFilePicker({
+          suggestedName: name,
+          types: [{ description: '画像', accept: { [blob.type]: [ext] } }]
+        });
+        const w = await h.createWritable();
+        await w.write(blob);
+        await w.close();
+        toast('保存しました（' + h.name + '）');
+        return;
+      }
+      if (download(blob, name)) { toast('保存しました（' + name + '）'); return; }
+      const f = file();
+      if (canShareFile(f)) { await navigator.share({ files: [f] }); return; }
+      openInTab(blob);
+    } catch (e) {
+      const n = e && e.name;
+      if (n === 'AbortError') return;                    // 自分でやめたときは何も言わない
+      if (n === 'NotAllowedError' || n === 'SecurityError') {
+        if (late) {                                      // 待っている間に「押した」の印が切れた
+          el.modal.hidden = false;
+          toast('もう一度，保存を押してください');
+          return;
+        }
+        openInTab(blob);
+        return;
+      }
+      toast('保存に失敗しました');
+    }
+  }
+
+  el.btnSave.addEventListener('click', () => {
+    const cr = S.crop || { x: 0, y: 0, w: S.img.width, h: S.img.height };
+    el.saveInfo.textContent =
+      Math.round(cr.w) + ' × ' + Math.round(cr.h) + ' px ・ ' +
+      S.regions.length + 'か所 ・ Exif消去';
+    el.btnShare.hidden = !(navigator.canShare && navigator.share);
+    el.modal.hidden = false;
+    prepare();                                           // 押される前に用意しておく
+  });
+  el.btnSaveCancel.addEventListener('click', () => { el.modal.hidden = true; });
+  el.modal.addEventListener('click', e => { if (e.target === el.modal) el.modal.hidden = true; });
+
+  el.fmtSeg.querySelectorAll('.seg-btn').forEach(b => b.addEventListener('click', () => {
+    el.fmtSeg.querySelectorAll('.seg-btn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    S.fmt = b.dataset.fmt;
+    el.qualityRow.hidden = S.fmt !== 'jpeg';
+    reprepare();
+  }));
+  el.rngQuality.addEventListener('input', reprepare);
+
   el.btnSaveDo.addEventListener('click', async () => {
     el.modal.hidden = true;
+    if (ready) { await deliver(ready); return; }         // ふつうはこちら
     busy('保存用の画像をつくっています…');
-    await nextFrame();
-    try {
-      const blob = await exportBlob();
-      const name = outName();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = name;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 4000);
-      unbusy(); toast('保存しました（' + name + '）');
-    } catch (e) { unbusy(); toast('保存に失敗しました'); }
+    try { await (readyJob || prepare()); } catch (e) {}
+    unbusy();
+    if (ready) await deliver(ready, true);
+    else toast('保存に失敗しました');
   });
 
   el.btnShare.addEventListener('click', async () => {
     el.modal.hidden = true;
-    busy('画像を準備しています…');
-    await nextFrame();
-    try {
-      const blob = await exportBlob();
-      const file = new File([blob], outName(), { type: blob.type });
+    let pack = ready, late = false;
+    if (!pack) {
+      busy('画像を準備しています…');
+      try { await (readyJob || prepare()); } catch (e) {}
       unbusy();
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: file.name });
-      } else toast('この端末では共有できません');
-    } catch (e) { unbusy(); }
+      pack = ready; late = true;
+    }
+    if (!pack) { toast('保存に失敗しました'); return; }
+    const f = new File([pack.blob], pack.name, { type: pack.blob.type });
+    if (!canShareFile(f)) { toast('この端末では共有できません'); return; }
+    try { await navigator.share({ files: [f] }); }
+    catch (e) {
+      if (e && e.name === 'AbortError') return;
+      if (late) { el.modal.hidden = false; toast('もう一度，押してください'); }
+    }
   });
 
   /* ================= 初期化 ================= */
