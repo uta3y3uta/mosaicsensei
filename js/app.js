@@ -154,7 +154,7 @@
   let modelsReady = false;
   async function ensureModels() {
     if (modelsReady) return;
-    busy('顔認識の準備をしています…（初回のみ）');
+    busy('顔認識の準備をしています…');
     /* 使う計算方法を先に決めておく。決めておかないと，同こんしていない
        wasm のファイルを取りにいこうとして，読みこみに失敗した記録が残る。 */
     try {
