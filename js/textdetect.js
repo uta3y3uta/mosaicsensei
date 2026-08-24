@@ -56,12 +56,19 @@ window.TextDetect = (function () {
       maxAspect: 7.0, maxSide: 0.32, maxArea: 0.042, maxCover: 0.18,
       txCard: 2.1
     },
+    /* 「強」は，小さい札・うすい札まで見つけるための段。
+       ここで下げてよいのは「大きさ」と「濃さ」の下限だけで，
+       「札らしさ」（地の平らさ・地と字の差・画数）まで下げてはいけない。
+       そこを下げると，木の葉も服の模様も掲示物も札とみなしてしまい，
+       写真ぜんたいがモザイクでうまる。
+       だから，見つける細かさ（scales と minSide）だけを上げ，
+       関門は「中」とほぼ同じに保つ。 */
     high: {
-      fill: 0.14, minSide: 6, minPx: 5, rawLo: 0.022, rawHi: 0.92,
-      elong: 1.00, trans: 1.4, scales: [1, 1.4, 1.9], grow: 0.9,
-      contrast: 38, paperFlat: 0.18, paperMin: 115, inkLo: 0.03, inkHi: 0.52,
-      maxAspect: 9.0, maxSide: 0.40, maxArea: 0.060, maxCover: 0.25,
-      txCard: 1.7
+      fill: 0.19, minSide: 7, minPx: 6, rawLo: 0.028, rawHi: 0.86,
+      elong: 1.00, trans: 1.8, scales: [1, 1.4, 1.9], grow: 0.9,
+      contrast: 47, paperFlat: 0.25, paperMin: 130, inkLo: 0.04, inkHi: 0.46,
+      maxAspect: 7.5, maxSide: 0.30, maxArea: 0.034, maxCover: 0.20,
+      txCard: 2.0
     }
   };
 

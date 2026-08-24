@@ -34,11 +34,17 @@
      conf: 顔と判定する自信のしきい値（低いほど拾う）
      pad: 顔のまわりをどれだけ広くかくすか
      passes: 顔さがしの手数（2で左右反転，3でタイル分割まで）
-     text: 文字さがしの強さ */
+     text: 文字さがしの強さ
+     cover: 顔でかくしてよい面積の合計（写真に対する割合）
+
+     conf を下げすぎると，顔でないものまで顔とみなす。手数も多いので，
+     はずれが積み上がって写真ぜんたいがうまってしまう。
+     「強」は，見のがしを減らすための段であって，
+     何でも消すための段ではない。 */
   const LV = {
-    1: { conf: 0.45, pad: 0.18, passes: 1, text: 'low' },
-    2: { conf: 0.20, pad: 0.28, passes: 2, text: 'mid' },
-    3: { conf: 0.05, pad: 0.42, passes: 3, text: 'high' }
+    1: { conf: 0.45, pad: 0.18, passes: 1, text: 'low',  cover: 0.85 },
+    2: { conf: 0.20, pad: 0.28, passes: 2, text: 'mid',  cover: 0.85 },
+    3: { conf: 0.12, pad: 0.30, passes: 3, text: 'high', cover: 0.55 }
   };
 
   const S = {
@@ -215,6 +221,7 @@
       for (const d of dets) {
         const b = back({ x: d.box.x, y: d.box.y, w: d.box.width, h: d.box.height });
         if (b.w < 8 || b.h < 8) continue;
+        b.score = d.score || d.classScore || 0;   // たしからしさ。あとで並べかえに使う
         if (!out.some(o => iou(o, b) > 0.32)) out.push(b);
       }
     };
@@ -250,6 +257,37 @@
     return out;
   }
 
+  /* 顔でかくす面積に上限をもうける。
+     文字さがしには前からある仕組みだが，顔さがしには無かった。
+     はずれが積み上がったときに写真ぜんたいがうまるのを，ここで止める。
+     たしからしい順に採るので，本物の顔から先に残る。
+     アップの写真では顔ひとつで上限をこえるので，先頭の1つは必ず残す。 */
+  function capCover(boxes, cover) {
+    if (!cover || cover >= 1 || !boxes.length) return boxes;
+    const iw = S.img.width, ih = S.img.height;
+    const gw = 160, gh = Math.max(1, Math.round(gw * ih / iw));
+    const mask = new Uint8Array(gw * gh);
+    const budget = gw * gh * cover;
+    const sorted = boxes.slice().sort((a, b) => (b.score || 0) - (a.score || 0));
+    const out = [];
+    let used = 0;
+    for (const b of sorted) {
+      const x0 = Math.max(0, Math.floor(b.x / iw * gw));
+      const y0 = Math.max(0, Math.floor(b.y / ih * gh));
+      const x1 = Math.min(gw - 1, Math.ceil((b.x + b.w) / iw * gw) - 1);
+      const y1 = Math.min(gh - 1, Math.ceil((b.y + b.h) / ih * gh) - 1);
+      let add = 0;
+      for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) if (!mask[y * gw + x]) add++;
+      if (used + add > budget && out.length) break;   // 予算ぎれ。ここまで
+      for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) mask[y * gw + x] = 1;
+      used += add;
+      out.push(b);
+    }
+    return out;
+  }
+
   function dropKind(kind) {
     const before = S.regions.length;
     S.regions = S.regions.filter(r => r.kind !== kind);
@@ -271,6 +309,7 @@
       return 0;
     }
     dropKind('face');
+    boxes = capCover(boxes, lv.cover);
     let added = 0;
     for (const b of boxes) {
       const px = b.w * lv.pad, py = b.h * lv.pad;
